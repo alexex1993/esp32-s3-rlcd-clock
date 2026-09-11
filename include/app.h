@@ -120,10 +120,12 @@ const char *weatherStamp();
 // Both screens are drawn by the same code in ui.cpp, so both fill the same
 // struct — a news item's `from` is its outlet, a page's is whoever sent it.
 //
-// The caps are what the panel can show: three lines of 41 cells in the 9x15
-// face, and Cyrillic is two bytes a cell. Anything longer is cut with "..."
-// when it is drawn, so carrying more would only be thrown away.
-#define FEED_TEXT_CAP 260
+// The caps are what the panel can show: a page may take the whole list area,
+// fifteen lines of 41 cells in the 9x15 face, and Cyrillic is two bytes a
+// cell — 1230 bytes at the very most. 1280 is past that, so a text cut here
+// always overflows the panel too and is drawn ending in "..."; a headline is
+// held to three lines when it is drawn and simply never fills it.
+#define FEED_TEXT_CAP 1280
 // 40 rather than the 24 a news outlet needs: a page is signed with whoever
 // sent it, and "Анна Петрова" is already 23 bytes of Cyrillic.
 #define FEED_FROM_CAP 40
@@ -221,9 +223,11 @@ bool audioNotify();
 // --- telegram.cpp ---------------------------------------------------------
 
 // The pager: messages sent to the bot named by TOKEN_BOT in .env, read over
-// a SOCKS5 tunnel. Same six slots as the news screen, for the same reason —
-// it is the same screen.
-#define PAGER_MAX_ITEMS 6
+// a SOCKS5 tunnel. How many of them are on the panel is decided by how many
+// lines they take, not by a slot count; ten is the most that can ever be
+// there at once — ten one-line pages fill the list area in ui.cpp exactly —
+// so holding more would only be thrown away.
+#define PAGER_MAX_ITEMS 10
 
 // Unlike the headlines, the pager is a *session* rather than a fetch: the
 // connection is held open for as long as the screen is up and getUpdates is
@@ -253,6 +257,11 @@ bool pagerTakeArrival();
 
 // Answers processed since boot, for the console's one-shot "P".
 uint32_t pagerResponses();
+
+// True while a 👀 reaction is still waiting to go out, or its answer is still
+// on the way back. Every message that reaches the pager gets one; "P" waits on
+// this so a one-shot read does not close the connection under them.
+bool pagerReacting();
 
 // A short Russian phrase for the footer: what the session is doing.
 const char *pagerStatus();

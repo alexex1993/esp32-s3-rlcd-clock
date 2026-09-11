@@ -69,15 +69,31 @@ static const int COL_X0 = (W - WEATHER_HOURS * COL_W) / 2;
 // screens do not jump against each other as KEY steps through them. Between
 // them the items *flow*: each takes as many lines as it needs and the next
 // starts underneath, so a screenful of short ones shows more of them than a
-// screenful of long ones. Nothing is drawn that would not fit whole.
+// screenful of long ones. Nothing is clipped mid-line: the item that meets
+// the bottom is wrapped again into the lines left, and says "..." about it.
 static const int FEED_PAD = 10;
 static const int FEED_MARK_W = 3;                       // rule down the left
 static const int FEED_TEXT_X = FEED_PAD + FEED_MARK_W + 7;
 static const int FEED_TOP = BAR_H + 8;
 static const int FEED_LEAD = 16;                        // 9x15, baseline to baseline
 static const int FEED_ITEM_GAP = 9;
-static const int FEED_MAX_LINES = 3;
 static const int FEED_BOTTOM = SUNSET_BASE - 18;
+// Every line the list area holds: fifteen. A page may take all of them — it
+// is somebody talking to you, and there is nowhere else to read the rest —
+// while a headline is held to three, so one long one cannot push the others
+// off the screen.
+static const int FEED_AREA_LINES = (FEED_BOTTOM - FEED_TOP) / FEED_LEAD;
+static const int NEWS_MAX_LINES = 3;
+static const int PAGER_MAX_LINES = FEED_AREA_LINES;
+// Who it is from and when, when the text leaves no room for them on its last
+// line and they take a line of their own: 6x12, so a tighter lead than the
+// text's — 14 is the least that keeps a Й on that line one pixel clear of a
+// descender on the line above. Only the pager does that — a page with no
+// sender is a page from nobody, while a headline without its outlet is still
+// the headline, and a line each would cost the news screen a headline.
+static const int FEED_META_LEAD = 14;
+static const bool NEWS_META_LINE = false;
+static const bool PAGER_META_LINE = true;
 // 41 cells of the 9x15 face fit the text column, and Cyrillic is two bytes a
 // cell.
 static const int FEED_LINE_CAP = 96;
@@ -664,9 +680,20 @@ static void drawFeedFooter(const char *left, const char *next) {
 // The screen both lists share. `why` is what to say when there is nothing to
 // list — which reason it is decides what the user has to go and fix, so the
 // callers below never collapse them into one message.
+//
+// `maxLines` is how tall one item may grow. The number of items is not fixed:
+// each takes what it needs and the next starts underneath, so a screenful of
+// short ones shows more of them. The one that meets the bottom of the list is
+// wrapped again into the lines that are left and ends in "...", rather than
+// being dropped and leaving that space empty — with pages allowed a whole
+// screen each, a long older one would otherwise blank most of the panel.
+//
+// `metaLine` is whether who-and-when may take a line of its own when the text
+// fills its last line; without it they are simply left off such an item.
 static void drawFeedScreen(const UiState &s, const char *heading,
-                           const FeedItem *items, int n, const char *footer,
-                           const char *why, const char *next) {
+                           const FeedItem *items, int n, int maxLines,
+                           bool metaLine, const char *footer, const char *why,
+                           const char *next) {
   drawFeedBar(s, heading);
 
   if (n <= 0) {
@@ -677,28 +704,18 @@ static void drawFeedScreen(const UiState &s, const char *heading,
   }
 
   const int textW = W - FEED_PAD - FEED_TEXT_X;
-  char lines[FEED_MAX_LINES][FEED_LINE_CAP];
+  // Static: fifteen lines of 96 bytes is too much to put on the loop task's
+  // stack for a frame, and only the loop task ever draws.
+  static char lines[FEED_AREA_LINES][FEED_LINE_CAP];
   int y = FEED_TOP;
 
   for (int i = 0; i < n; i++) {
-    lcd.setFont(u8g2_font_9x15_t_cyrillic);
-    const int count = wrapText(items[i].text, textW, FEED_MAX_LINES, lines);
-    if (count <= 0) continue;
+    const int space = FEED_BOTTOM - y;
+    const int room = space / FEED_LEAD;
+    if (room <= 0) break;
 
-    const int h = count * FEED_LEAD;
-    if (y + h > FEED_BOTTOM) break;  // stop on a whole item, never mid-one
-
-    // A rule down the left groups the wrapped lines into one item without
-    // spending a line of height on a bullet.
-    lcd.drawBox(FEED_PAD, y + 3, FEED_MARK_W, h - 6);
-    for (int l = 0; l < count; l++) {
-      lcd.drawUTF8(FEED_TEXT_X, y + 12 + l * FEED_LEAD, lines[l]);
-    }
-
-    // Who it is from and when, tucked onto the end of the last line, but only
-    // where the text left room — the alternative is a line of its own per
-    // item, which costs a whole extra item over a screenful.
-    const int lastW = lcd.getUTF8Width(lines[count - 1]);
+    // Who it is from and when. Measured first, because whether it fits
+    // decides how the text is wrapped at the bottom of the list.
     char meta[FEED_FROM_CAP + 8];
     if (items[i].timed) {
       snprintf(meta, sizeof(meta), "%s %02u:%02u", items[i].from,
@@ -707,9 +724,50 @@ static void drawFeedScreen(const UiState &s, const char *heading,
       snprintf(meta, sizeof(meta), "%s", items[i].from);
     }
     lcd.setFont(u8g2_font_6x12_t_cyrillic);
-    if (meta[0] != '\0' &&
-        FEED_TEXT_X + lastW + 14 + lcd.getUTF8Width(meta) <= W - FEED_PAD) {
-      drawRight(meta, W - FEED_PAD, y + 12 + (count - 1) * FEED_LEAD);
+    const int metaW = lcd.getUTF8Width(meta);
+
+    lcd.setFont(u8g2_font_9x15_t_cyrillic);
+    const int limit = maxLines < room ? maxLines : room;
+    int count = wrapText(items[i].text, textW, limit, lines);
+    if (count <= 0) continue;
+
+    // Tucked onto the end of the last line where the text left room, which
+    // costs no height at all. Where it did not — every long page — it goes on
+    // a short line of its own underneath, if this list allows that.
+    const bool hasMeta = meta[0] != '\0';
+    bool metaInline =
+        hasMeta && FEED_TEXT_X + lcd.getUTF8Width(lines[count - 1]) + 14 +
+                           metaW <= W - FEED_PAD;
+    bool metaOwn = hasMeta && !metaInline && metaLine;
+    if (metaOwn && count * FEED_LEAD + FEED_META_LEAD > space) {
+      // The bottom of the list, with no height left for that line. The text
+      // gives up its last line to it rather than the page losing its sender:
+      // it ends in "..." either way.
+      if (count > 1) {
+        count = wrapText(items[i].text, textW, count - 1, lines);
+        metaInline = FEED_TEXT_X + lcd.getUTF8Width(lines[count - 1]) + 14 +
+                         metaW <= W - FEED_PAD;
+        metaOwn = !metaInline;
+      } else {
+        metaOwn = false;
+      }
+    }
+
+    const int h = count * FEED_LEAD + (metaOwn ? FEED_META_LEAD : 0);
+    const int lastBase = y + 12 + (count - 1) * FEED_LEAD;
+
+    // A rule down the left groups the wrapped lines into one item without
+    // spending a line of height on a bullet.
+    lcd.drawBox(FEED_PAD, y + 3, FEED_MARK_W, h - 6);
+    for (int l = 0; l < count; l++) {
+      lcd.drawUTF8(FEED_TEXT_X, y + 12 + l * FEED_LEAD, lines[l]);
+    }
+
+    lcd.setFont(u8g2_font_6x12_t_cyrillic);
+    if (metaInline) {
+      drawRight(meta, W - FEED_PAD, lastBase);
+    } else if (metaOwn) {
+      drawRight(meta, W - FEED_PAD, lastBase + FEED_META_LEAD);
     }
 
     y += h + FEED_ITEM_GAP;
@@ -741,8 +799,8 @@ static void drawNewsScreen(const UiState &s) {
 #elif !defined(NEWS_API_KEY)
   why = "нет ключа NEWS_API в .env";
 #endif
-  drawFeedScreen(s, kNewsHeading, newsItems(), newsCount(), footer, why,
-                 "ПЕЙДЖЕР");
+  drawFeedScreen(s, kNewsHeading, newsItems(), newsCount(), NEWS_MAX_LINES,
+                 NEWS_META_LINE, footer, why, "ПЕЙДЖЕР");
 }
 
 static void drawPagerScreen(const UiState &s) {
@@ -785,8 +843,8 @@ static void drawPagerScreen(const UiState &s) {
 #elif !defined(SOCKS5_HOST)
   why = "нет SOCKS5_HOST в .env";
 #endif
-  drawFeedScreen(s, kPagerHeading, pagerItems(), pagerCount(), footer, why,
-                 "ЧАСЫ");
+  drawFeedScreen(s, kPagerHeading, pagerItems(), pagerCount(), PAGER_MAX_LINES,
+                 PAGER_META_LINE, footer, why, "ЧАСЫ");
 }
 
 void uiDraw(const UiState &s) {

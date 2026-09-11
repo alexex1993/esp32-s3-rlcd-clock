@@ -365,16 +365,18 @@ static void handleConsole() {
       // credentials, the bot token), and pressing a button on the desk is a
       // poor way to read the reason off the console.
       //
-      // One answer, not a session: open, spin until something comes back or
-      // the patience runs out, then close. Skipped while the screen is up,
-      // where a session is already running and a second one would fight it.
+      // One answer, not a session: open, spin until something comes back —
+      // and the 👀 for whatever it brought have gone out — or the patience
+      // runs out, then close. Skipped while the screen is up, where a session
+      // is already running and a second one would fight it.
       if (s_screen == UI_SCREEN_PAGER) {
         Serial.println("pager: the screen is up, the session is already live");
       } else if (radioUp("pager")) {
         const uint32_t before = pagerResponses();
         pagerOpen();
         const uint32_t t0 = millis();
-        while (pagerResponses() == before && millis() - t0 < 40000) {
+        while ((pagerResponses() == before || pagerReacting()) &&
+               millis() - t0 < 40000) {
           pagerPoll();
           delay(10);
         }

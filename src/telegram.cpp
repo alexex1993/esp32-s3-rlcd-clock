@@ -43,6 +43,13 @@
 //     pager that is actually live, and it is the way every Telegram bot
 //     works.
 //
+//   * Every message that reaches the pager is answered with a 👀 reaction,
+//     so whoever sent it can see from their own chat that the clock has it.
+//     It rides the same connection: one setMessageReaction per message goes
+//     out ahead of the next long poll. A reaction Telegram refuses — a
+//     service message, a group with reactions switched off — is logged and
+//     forgotten, not taken as a reason to drop a session that is fine.
+//
 // The answer is never held whole. It is walked once through a 256-byte window
 // by a small recursive-descent reader that knows how to skip a value it does
 // not want, so nesting is handled exactly — which matters here in a way it
@@ -79,6 +86,7 @@ void pagerClose() {}
 bool pagerLive() { return false; }
 bool pagerTakeArrival() { return false; }
 uint32_t pagerResponses() { return 0; }
+bool pagerReacting() { return false; }
 const char *pagerStatus() { return ""; }
 
 #else
@@ -536,8 +544,12 @@ struct Reader {
 static int readerByte(void *ctx) { return ((Reader *)ctx)->next(); }
 
 // Parser scratch, shared by everything below: one fetch at a time, on one
-// task. On the stack this would be most of the loop task's 8 KB.
-static char s_raw[512];
+// task. On the stack this would be a third of the loop task's 8 KB. A
+// message's text lands here before textSanitise() folds it into
+// FeedItem::text, so it is twice that cap: emoji and the rest of what the
+// panel cannot draw come out on the way, and what is left still has to be
+// enough to fill the screen.
+static char s_raw[FEED_TEXT_CAP * 2];
 
 static bool isJsonSpace(int c) {
   return c == ' ' || c == '\t' || c == '\n' || c == '\r';
@@ -681,8 +693,9 @@ static bool parseFrom(Reader &r, char *out, size_t cap) {
 }
 
 // A group's or channel's name, for the messages that carry no sender of their
-// own — a channel post has a `chat` and no `from`.
-static bool parseChat(Reader &r, char *out, size_t cap) {
+// own — a channel post has a `chat` and no `from`. Its id is what the 👀 is
+// addressed to.
+static bool parseChat(Reader &r, char *out, size_t cap, long long *id) {
   char key[20];
   char title[48] = "", first[48] = "";
 
@@ -691,7 +704,11 @@ static bool parseChat(Reader &r, char *out, size_t cap) {
     if (m < 0) return false;
     if (m == 0) break;
 
-    if (strcmp(key, "title") == 0) {
+    if (strcmp(key, "id") == 0) {
+      const int c = skipWs(r);
+      if (c < 0) return false;
+      *id = readNumberFrom(r, c);
+    } else if (strcmp(key, "title") == 0) {
       if (!readStringValue(r, title, sizeof(title))) return false;
     } else if (strcmp(key, "first_name") == 0) {
       if (!readStringValue(r, first, sizeof(first))) return false;
@@ -707,7 +724,12 @@ static bool parseChat(Reader &r, char *out, size_t cap) {
 // The '{' of the message object has been consumed. Returns false only when
 // the body ran out: a message with nothing in it still fills a slot, saying
 // so, because a page that arrived is news even when it is a sticker.
-static bool parseMessage(Reader &r, FeedItem *out) {
+//
+// `*chatId` and `*messageId` are where its 👀 goes. Both are read from this
+// message's own members only: `reply_to_message` is skipped whole, so the ids
+// of the message being replied to never overwrite them.
+static bool parseMessage(Reader &r, FeedItem *out, long long *chatId,
+                         long long *messageId) {
   char key[24];
   char from[96] = "", chat[96] = "";
   long long date = 0;
@@ -731,6 +753,10 @@ static bool parseMessage(Reader &r, FeedItem *out) {
       const int c = skipWs(r);
       if (c < 0) return false;
       date = readNumberFrom(r, c);
+    } else if (strcmp(key, "message_id") == 0) {
+      const int c = skipWs(r);
+      if (c < 0) return false;
+      *messageId = readNumberFrom(r, c);
     } else if (strcmp(key, "from") == 0) {
       const int c = skipWs(r);
       if (c == '{') {
@@ -741,7 +767,7 @@ static bool parseMessage(Reader &r, FeedItem *out) {
     } else if (strcmp(key, "chat") == 0) {
       const int c = skipWs(r);
       if (c == '{') {
-        if (!parseChat(r, chat, sizeof(chat))) return false;
+        if (!parseChat(r, chat, sizeof(chat), chatId)) return false;
       } else if (!skipValueFrom(r, c)) {
         return false;
       }
@@ -776,16 +802,14 @@ static bool parseMessage(Reader &r, FeedItem *out) {
 }
 
 // --- the last few, newest first -------------------------------------------
-// Telegram hands updates back oldest first, and only the tail of them fits on
-// the panel, so they go into a ring as they are read and come out backwards.
+// Telegram hands updates back oldest first and the panel wants them newest
+// first, so each message read goes in at the front of s_items and pushes the
+// rest down. There is no separate ring to copy out of: at 1.3 KB an item, a
+// second array of them would be 13 KB of RAM spent on bookkeeping.
 //
-// The ring is *not* cleared between polls, which is the difference a live
+// The list is *not* cleared between polls, which is the difference a live
 // session makes: after the first one, each answer carries only what is new,
 // and what it carries is added to what is already on the screen.
-
-static FeedItem s_ring[PAGER_MAX_ITEMS];
-static int s_ringHead = 0;
-static int s_ringCount = 0;
 
 // The read cursor. `primed` means a real update_id has been seen, so polls
 // can carry a real offset and Telegram will hold them open instead of
@@ -799,17 +823,61 @@ static bool s_firstEver = true;
 static int s_added = 0;
 static bool s_arrived = false;
 
-static void ringPush(const FeedItem &it) {
-  s_ring[s_ringHead] = it;
-  s_ringHead = (s_ringHead + 1) % PAGER_MAX_ITEMS;
-  if (s_ringCount < PAGER_MAX_ITEMS) s_ringCount++;
+// Whatever falls off the end is older than anything the panel could show.
+static void pushNewest(const FeedItem &it) {
+  const int keep = s_count < PAGER_MAX_ITEMS ? s_count : PAGER_MAX_ITEMS - 1;
+  memmove(&s_items[1], &s_items[0], (size_t)keep * sizeof(s_items[0]));
+  s_items[0] = it;
+  s_count = keep + 1;
   s_added++;
 }
+
+// --- the 👀 ---------------------------------------------------------------
+// Only the two ids are kept, and only until the reaction has gone out.
+// PG_REQUEST drains the queue ahead of the next long poll, so it never holds
+// more than one answer's worth of messages — FETCH_UPDATES of them.
+//
+// In an anonymous namespace for the same reason as Reader.
+namespace {
+
+struct Reaction {
+  long long chat;
+  long long message;
+};
+
+}  // namespace
+
+static Reaction s_reactions[FETCH_UPDATES];
+static int s_reactCount = 0;
+static int s_reactNext = 0;
+
+static void queueReaction(long long chat, long long message) {
+  if (chat == 0 || message <= 0) return;  // nothing to address it to
+  if (s_reactCount >= FETCH_UPDATES) {
+    Serial.println("pager: the reaction queue is full, a message goes without");
+    return;
+  }
+  s_reactions[s_reactCount++] = {chat, message};
+}
+
+static bool reactionQueued() { return s_reactNext < s_reactCount; }
+
+// The oldest queued reaction, off the front; the queue rewinds once empty.
+static Reaction takeReaction() {
+  const Reaction rx = s_reactions[s_reactNext++];
+  if (s_reactNext >= s_reactCount) s_reactNext = s_reactCount = 0;
+  return rx;
+}
+
+// The message being parsed. At 1.3 KB a FeedItem is too big to put on the
+// loop task's stack underneath a TLS read.
+static FeedItem s_parsed;
 
 // The '{' of the update object has been consumed.
 static bool parseUpdate(Reader &r) {
   char key[24];
-  FeedItem item;
+  FeedItem &item = s_parsed;
+  long long chat = 0, message = 0;
   bool have = false;
 
   for (;;) {
@@ -835,14 +903,17 @@ static bool parseUpdate(Reader &r) {
                            strcmp(key, "edited_message") == 0;
     const int c = skipWs(r);
     if (isMessage && c == '{' && !have) {
-      if (!parseMessage(r, &item)) return false;
+      if (!parseMessage(r, &item, &chat, &message)) return false;
       have = true;
     } else if (!skipValueFrom(r, c)) {
       return false;
     }
   }
 
-  if (have) ringPush(item);
+  if (have) {
+    pushNewest(item);
+    queueReaction(chat, message);
+  }
   return true;
 }
 
@@ -1002,8 +1073,22 @@ static uint32_t s_responses = 0;
 static bool s_keepAlive = true;
 static Reader s_reader;
 
+// Which of the two requests is outstanding, so that its answer is read as the
+// right thing.
+enum PagerRequest {
+  REQ_UPDATES = 0,  // getUpdates: the long poll
+  REQ_REACTION,     // setMessageReaction: one 👀
+};
+static PagerRequest s_inFlight = REQ_UPDATES;
+
 uint32_t pagerResponses() { return s_responses; }
 bool pagerLive() { return s_state == PG_REQUEST || s_state == PG_WAIT; }
+
+bool pagerReacting() {
+  if (reactionQueued()) return true;
+  return s_inFlight == REQ_REACTION &&
+         (s_state == PG_WAIT || s_state == PG_READ);
+}
 
 bool pagerTakeArrival() {
   const bool was = s_arrived;
@@ -1022,18 +1107,52 @@ const char *pagerStatus() {
   }
 }
 
-// Copies the ring out newest-first and stamps the clock.
+// Stamps the clock on what the list now shows.
 static void publish() {
-  s_count = s_ringCount;
-  for (int i = 0; i < s_ringCount; i++) {
-    const int slot = (s_ringHead - 1 - i + PAGER_MAX_ITEMS) % PAGER_MAX_ITEMS;
-    s_items[i] = s_ring[slot];
-  }
-
   struct tm now;
   const time_t t = time(nullptr);
   localtime_r(&t, &now);
   snprintf(s_stamp, sizeof(s_stamp), "%02d:%02d", now.tm_hour, now.tm_min);
+}
+
+// One POST with a JSON body, headers and all. The token is in the path, which
+// is where Telegram puts it and why this connection is worth a verified
+// certificate.
+static bool sendPost(const char *method, const char *body, int bodyLen) {
+  if (bodyLen <= 0) return false;
+
+  char head[320];
+  const int headLen =
+      snprintf(head, sizeof(head),
+               "POST /bot%s/%s HTTP/1.1\r\n"
+               "Host: %s\r\n"
+               "User-Agent: rlcd-esp32s3-pager\r\n"
+               "Content-Type: application/json\r\n"
+               "Content-Length: %d\r\n"
+               "Connection: keep-alive\r\n"
+               "\r\n",
+               TELEGRAM_BOT_TOKEN, method, kHost, bodyLen);
+  if (headLen <= 0 || headLen >= (int)sizeof(head)) {
+    Serial.println("pager: the request headers do not fit");
+    s_error = "неверный токен бота";
+    return false;
+  }
+
+  return tlsWrite(head, (size_t)headLen) && tlsWrite(body, (size_t)bodyLen);
+}
+
+// A 👀 on one message. U+1F440 is one of the fixed set of emoji a bot may
+// react with; it goes in as its four UTF-8 bytes, spelled as hex escapes so
+// this line stays ASCII whatever the file is opened in.
+static bool sendReaction(const Reaction &rx) {
+  char body[160];
+  const int bodyLen = snprintf(
+      body, sizeof(body),
+      "{\"chat_id\":%lld,\"message_id\":%lld,"
+      "\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"\xF0\x9F\x91\x80\"}]}",
+      rx.chat, rx.message);
+  if (bodyLen >= (int)sizeof(body)) return false;
+  return sendPost("setMessageReaction", body, bodyLen);
 }
 
 static bool sendRequest() {
@@ -1057,46 +1176,38 @@ static bool sendRequest() {
                        s_firstEver ? 0 : LONGPOLL_S);
   }
 
-  // The token is in the path, which is where Telegram puts it and why this
-  // request is worth a verified certificate.
-  char head[320];
-  const int headLen =
-      snprintf(head, sizeof(head),
-               "POST /bot%s/getUpdates HTTP/1.1\r\n"
-               "Host: %s\r\n"
-               "User-Agent: rlcd-esp32s3-pager\r\n"
-               "Content-Type: application/json\r\n"
-               "Content-Length: %d\r\n"
-               "Connection: keep-alive\r\n"
-               "\r\n",
-               TELEGRAM_BOT_TOKEN, kHost, bodyLen);
-  if (headLen <= 0 || headLen >= (int)sizeof(head)) {
-    Serial.println("pager: the request headers do not fit");
-    s_error = "неверный токен бота";
-    return false;
-  }
-
-  return tlsWrite(head, (size_t)headLen) && tlsWrite(body, (size_t)bodyLen);
+  return sendPost("getUpdates", body, bodyLen);
 }
 
-// One whole answer. Returns false when the session has to be rebuilt.
-static bool readResponse(bool *changed) {
-  int status = 0;
+// Status line, headers, the body walked for `"ok"`, and the stream left on the
+// first byte of whatever comes next. False when the connection itself failed;
+// whether Telegram agreed is *ok, and *status is for the log.
+static bool readAnswer(int *status, bool *ok) {
   long long contentLength = -1;
   bool chunked = false;
   bool keepAlive = true;
 
-  if (!readHttpHead(s_reader, &status, &contentLength, &chunked, &keepAlive)) {
+  if (!readHttpHead(s_reader, status, &contentLength, &chunked, &keepAlive)) {
     Serial.println("pager: no answer from telegram");
     s_error = "телеграм не ответил";
     return false;
   }
   s_reader.beginBody(contentLength, chunked);
 
-  s_added = 0;
-  const bool ok = parseResponse(s_reader);
+  *ok = parseResponse(s_reader);
   s_reader.drain();
   s_keepAlive = keepAlive && !s_reader.dead;
+  return true;
+}
+
+// One whole getUpdates answer. Returns false when the session has to be
+// rebuilt.
+static bool readResponse(bool *changed) {
+  int status = 0;
+  bool ok = false;
+
+  s_added = 0;
+  if (!readAnswer(&status, &ok)) return false;
   s_responses++;
 
   if (!ok) {
@@ -1126,6 +1237,21 @@ static bool readResponse(bool *changed) {
   }
 
   s_firstEver = false;
+  return true;
+}
+
+// The answer to a 👀: `{"ok":true,"result":true}`, or a refusal whose
+// description parseResponse() has already printed. A refusal is no reason to
+// rebuild a session that is otherwise fine, so only a connection that failed
+// returns false.
+static bool readReactionAnswer() {
+  int status = 0;
+  bool ok = false;
+  if (!readAnswer(&status, &ok)) return false;
+  if (!ok) {
+    Serial.printf("pager: telegram would not take the reaction (HTTP %d)\n",
+                  status);
+  }
   return true;
 }
 
@@ -1192,11 +1318,26 @@ bool pagerPoll() {
 
     case PG_REQUEST: {
       s_deadline = millis() + REQUEST_BUDGET_MS;
-      if (!sendRequest()) {
-        dropSession("the request would not go out");
-        return true;
+      if (reactionQueued()) {
+        // The 👀 for what the last answer brought go out first, one short
+        // round trip each; a long poll sent now would hold the connection
+        // for up to LONGPOLL_S with them still waiting. Taken off the queue
+        // before it is sent, so a connection that drops under it costs that
+        // one reaction rather than retrying it ahead of the pager forever.
+        s_inFlight = REQ_REACTION;
+        if (!sendReaction(takeReaction())) {
+          dropSession("the reaction would not go out");
+          return true;
+        }
+        s_waitUntil = millis() + READ_BUDGET_MS;
+      } else {
+        s_inFlight = REQ_UPDATES;
+        if (!sendRequest()) {
+          dropSession("the request would not go out");
+          return true;
+        }
+        s_waitUntil = millis() + WAIT_BUDGET_MS;
       }
-      s_waitUntil = millis() + WAIT_BUDGET_MS;
       s_state = PG_WAIT;
       return false;
     }
@@ -1209,7 +1350,8 @@ bool pagerPoll() {
       if ((int32_t)(millis() - s_waitUntil) >= 0) {
         // Telegram closes a long poll on its own well before this, so a
         // silence this long is the connection, not the bot.
-        dropSession("the long poll went quiet");
+        dropSession(s_inFlight == REQ_REACTION ? "the reaction went unanswered"
+                                               : "the long poll went quiet");
         return true;
       }
       return false;
@@ -1218,7 +1360,8 @@ bool pagerPoll() {
     case PG_READ: {
       s_deadline = millis() + READ_BUDGET_MS;
       bool changed = false;
-      const bool ok = readResponse(&changed);
+      const bool ok = (s_inFlight == REQ_REACTION) ? readReactionAnswer()
+                                                   : readResponse(&changed);
       if (!ok || !s_keepAlive) {
         // A refused request is not worth hammering; a closed keep-alive just
         // needs the connection built again, which PG_RETRY also does.
