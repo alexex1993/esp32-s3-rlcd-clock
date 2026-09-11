@@ -8,10 +8,10 @@
 //
 //   0..25    status bar: date and a small battery gauge
 //   40..132  the clock, HH:MM huge with the seconds set alongside
-//   144..158 outdoors right now: temperature, humidity, pressure
+//   144..158 outdoors right now: temperature, humidity, pressure, UV, air
 //   168      rule
 //   179..272 twelve hourly columns: hour, glyph, temperature, chance of rain
-//   279..294 today's sunset, and when the forecast was last fetched
+//   279..294 a warning if there is one, today's sunset, the forecast's age
 //
 // The bands below the rule are spaced to land the sunset line one text gap
 // off the bottom edge rather than leaving the strip floating: everything
@@ -410,62 +410,75 @@ static void drawClock(const UiState &s) {
   lcd.drawStr(x0 + wHM + gap, CLOCK_BASE, ss);
 }
 
-// What it is doing outside on the left, whatever needs saying on the right.
-// This used to be the on-board SHTC3's indoor reading; it is now the same
-// Open-Meteo `current` block the forecast strip comes from, so the whole face
-// talks about one place. The SHTC3 is still readable at the console with "?".
-static void drawOutdoorRow(const UiState &s) {
-  char buf[48];
-
-  // Label and unit in Cyrillic, the reading itself in the heavier helv face
-  // that has the degree sign. The unit is the bare "мм": spelling out
-  // "мм рт.ст." costs 60 px and pushes the note off the right of the row.
-  int x = drawRun(10, SENSOR_BASE, u8g2_font_9x15_t_cyrillic, "НА УЛИЦЕ ");
+// What it is doing outside, the whole width of the panel: temperature,
+// humidity, pressure, then the UV index and the air quality. This used to be
+// the on-board SHTC3's indoor reading; it is now Open-Meteo's, so the whole
+// face talks about one place. The SHTC3 is still readable at the console.
+//
+// There is no label for the place: the row speaks for itself, and the 81 px
+// "НА УЛИЦЕ" took went to the last two readings. Those did take the right end
+// of the row, where warnings used to go, so those moved down to the footer.
+//
+// Readings in the heavier helv face that has the degree sign, labels and
+// units in Cyrillic. The worst case, "-12.5°C 100% 760 мм УФ 11 воздух 146",
+// measures ~346 px against the 390 available, so nothing here is fit-checked:
+// the row has nothing to collide with. The unit is the bare "мм", and the air
+// is "воздух" rather than "качество воздуха": the long forms do not fit.
+static void drawOutdoorRow() {
+  static const int GAP = 14;  // between readings
+  static const int TIE = 5;   // between a reading and its label
+  const uint8_t *const reading = u8g2_font_helvB14_tf;
+  const uint8_t *const label = u8g2_font_9x15_t_cyrillic;
 
   WeatherNow now;
-  if (weatherNow(&now)) {
-    char t[12] = "--", rh[12] = "--", mm[12] = "--";
-    if (!isnan(now.temp)) {
-      snprintf(t, sizeof(t), "%.1f\xC2\xB0" "C", now.temp);
-    }
-    if (!isnan(now.humidity)) {
-      snprintf(rh, sizeof(rh), "%.0f%%", now.humidity);
-    }
-    if (!isnan(now.pressure)) {
-      // Millimetres of mercury: what a forecast is quoted in here, and what
-      // the barometer on the wall next to this clock reads.
-      snprintf(mm, sizeof(mm), "%.0f", now.pressure * 0.750062f);
-    }
-    snprintf(buf, sizeof(buf), "%s  %s  %s ", t, rh, mm);
-    x = drawRun(x, SENSOR_BASE, u8g2_font_helvB14_tf, buf);
-    x = drawRun(x, SENSOR_BASE, u8g2_font_9x15_t_cyrillic, "мм");
-  } else {
-    x = drawRun(x, SENSOR_BASE, u8g2_font_9x15_t_cyrillic, "нет данных");
+  if (!weatherNow(&now)) {
+    drawRun(10, SENSOR_BASE, label, "нет данных");
+    return;
   }
 
-  const char *right = nullptr;
-  if (s.note != nullptr && s.note[0] != '\0') {
-    right = s.note;
-  } else if (!s.timeValid) {
-    // Short on purpose: it shares the row with the outdoor reading, and the
-    // console already prints the long version with the command to fix it.
-    right = "ЧАСЫ НЕ ЗАДАНЫ";
+  char t[12] = "--", rh[8] = "--", mm[8] = "--", uv[8] = "--", aqi[8] = "--";
+  if (!isnan(now.temp)) {
+    snprintf(t, sizeof(t), "%.1f\xC2\xB0" "C", now.temp);
   }
-  if (right != nullptr) {
-    lcd.setFont(u8g2_font_7x13_t_cyrillic);
-    // Both halves are variable-width, so the fit is checked rather than
-    // assumed — overlapping text on a 1 bpp panel is unreadable, not just ugly.
-    if (x + 12 + lcd.getUTF8Width(right) <= W - 10) {
-      drawRight(right, W - 10, SENSOR_BASE);
-    }
+  if (!isnan(now.humidity)) {
+    snprintf(rh, sizeof(rh), "%.0f%%", now.humidity);
   }
+  if (!isnan(now.pressure)) {
+    // Millimetres of mercury: what a forecast is quoted in here, and what
+    // the barometer on the wall next to this clock reads.
+    snprintf(mm, sizeof(mm), "%.0f", now.pressure * 0.750062f);
+  }
+  if (!isnan(now.uv)) {
+    // A whole number, as the index is always quoted.
+    snprintf(uv, sizeof(uv), "%ld", lroundf(now.uv));
+  }
+  if (!isnan(now.aqi)) {
+    snprintf(aqi, sizeof(aqi), "%ld", lroundf(now.aqi));
+  }
+
+  int x = 10;
+  x = drawRun(x, SENSOR_BASE, reading, t) + GAP;
+  x = drawRun(x, SENSOR_BASE, reading, rh) + GAP;
+  x = drawRun(x, SENSOR_BASE, reading, mm) + TIE;
+  x = drawRun(x, SENSOR_BASE, label, "мм") + GAP;
+  x = drawRun(x, SENSOR_BASE, label, "УФ") + TIE;
+  x = drawRun(x, SENSOR_BASE, reading, uv) + GAP;
+  x = drawRun(x, SENSOR_BASE, label, "воздух") + TIE;
+  drawRun(x, SENSOR_BASE, reading, aqi);
 }
 
 // The strip under the columns: today's sunset centred and bold, with the age
 // of the forecast set small on the right. The stamp used to sit up in the
 // title band; it is a footnote, and this is where footnotes go.
-static void drawFooter() {
+//
+// Whatever needs saying — a low battery, a clock nobody has set — goes on the
+// left, the only place on the face with room to spare now that the outdoor
+// row runs the full width.
+static void drawFooter(const UiState &s) {
   char buf[32];  // UTF-8: "обновлено 21:04" is 24 bytes
+
+  // The note on the left is fit-checked against whatever sits in the middle.
+  int noteLimit = W / 2;
 
   const char *at = weatherSunset();
   // Drawn only once there is a value: an empty label is worse than no label.
@@ -481,6 +494,7 @@ static void drawFooter() {
 
     drawSunsetGlyph(x0 + glyphW / 2, SUNSET_BASE - 4, r);
     drawBoldUTF8(x0 + glyphW + gap, SUNSET_BASE, buf);
+    noteLimit = x0;
   }
 
   lcd.setFont(u8g2_font_6x12_t_cyrillic);
@@ -490,6 +504,24 @@ static void drawFooter() {
     snprintf(buf, sizeof(buf), "нет данных");
   }
   drawRight(buf, W - 10, SUNSET_BASE);
+
+  const char *note = nullptr;
+  if (s.note != nullptr && s.note[0] != '\0') {
+    note = s.note;
+  } else if (!s.timeValid) {
+    // Short on purpose: the console already prints the long version with the
+    // command to fix it.
+    note = "ЧАСЫ НЕ ЗАДАНЫ";
+  }
+  if (note != nullptr) {
+    lcd.setFont(u8g2_font_7x13_t_cyrillic);
+    // "ЧАСЫ НЕ ЗАДАНЫ" is 97 px and the sunset block starts ~123 px in, so it
+    // fits — but both are variable-width, and overlapping text on a 1 bpp
+    // panel is unreadable, not just ugly.
+    if (10 + lcd.getUTF8Width(note) + 12 <= noteLimit) {
+      lcd.drawUTF8(10, SUNSET_BASE, note);
+    }
+  }
 }
 
 static void drawForecast(const UiState &s) {
@@ -860,9 +892,9 @@ void uiDraw(const UiState &s) {
     default:
       drawStatusBar(s);
       drawClock(s);
-      drawOutdoorRow(s);
+      drawOutdoorRow();
       drawForecast(s);
-      drawFooter();
+      drawFooter(s);
       break;
   }
 

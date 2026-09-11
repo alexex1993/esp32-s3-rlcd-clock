@@ -33,6 +33,17 @@
 //     lib_deps at a single entry (U8g2). The parsers are deliberately dumb:
 //     they scan for `"<key>":[` and read numbers until the closing bracket, or
 //     for `"<key>":` inside one named object and read a single number.
+//
+// The same row on the face also carries the air quality and the UV index,
+// which Open-Meteo serves from a different host, so they cannot ride in the
+// request above:
+//
+//   http://air-quality-api.open-meteo.com/v1/air-quality
+//       ?latitude=..&longitude=..&current=european_aqi,uv_index
+//
+// Same terms — no key, plain HTTP, one flat `current` object — but its own
+// call, airQualityFetch(), so one service being down never costs the face the
+// other's readings.
 
 #include <Arduino.h>
 #include <math.h>
@@ -47,7 +58,7 @@
 static WeatherHour s_hours[WEATHER_HOURS];
 static int s_count = 0;
 static char s_stamp[8] = "";
-static WeatherNow s_now = {NAN, NAN, NAN};
+static WeatherNow s_now = {NAN, NAN, NAN, NAN, NAN};
 static bool s_nowValid = false;
 static char s_sunset[8] = "";
 
@@ -68,10 +79,35 @@ bool weatherNow(WeatherNow *out) {
 // No credentials compiled in, so there is no network to ask. The panel simply
 // leaves the forecast strip empty and says so.
 bool weatherFetch() { return false; }
+bool airQualityFetch() { return false; }
 
 #else
 
 static const uint32_t HTTP_TIMEOUT_MS = 8000;
+
+// One GET, the whole body into *body. False, having said why, on anything but
+// a 200. `what` names the caller in the log.
+static bool httpGet(const char *what, const String &url, String *body) {
+  HTTPClient http;
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.setReuse(false);
+  if (!http.begin(url)) {
+    Serial.printf("%s: could not open the connection\n", what);
+    return false;
+  }
+
+  const int status = http.GET();
+  if (status != HTTP_CODE_OK) {
+    Serial.printf("%s: HTTP %d\n", what, status);
+    http.end();
+    return false;
+  }
+
+  *body = http.getString();
+  http.end();
+  return true;
+}
 
 // `"hourly"` is the only object in the response whose members are arrays, so
 // `"<key>":[` cannot collide with the same key inside "hourly_units", where it
@@ -170,24 +206,8 @@ bool weatherFetch() {
       "&daily=sunset"
       "&forecast_hours=" + String(WEATHER_HOURS) + "&timezone=" + WEATHER_TZ;
 
-  HTTPClient http;
-  http.setConnectTimeout(HTTP_TIMEOUT_MS);
-  http.setTimeout(HTTP_TIMEOUT_MS);
-  http.setReuse(false);
-  if (!http.begin(url)) {
-    Serial.println("weather: could not open the connection");
-    return false;
-  }
-
-  const int status = http.GET();
-  if (status != HTTP_CODE_OK) {
-    Serial.printf("weather: HTTP %d\n", status);
-    http.end();
-    return false;
-  }
-
-  const String body = http.getString();
-  http.end();
+  String body;
+  if (!httpGet("weather", url, &body)) return false;
 
   const char *json = body.c_str();
 
@@ -257,6 +277,39 @@ bool weatherFetch() {
                 " code %u, sunset %s\n",
                 n, s_hours[0].hour, s_now.temp, s_now.humidity, s_now.pressure,
                 s_hours[0].code, s_sunset[0] != '\0' ? s_sunset : "?");
+  return true;
+}
+
+bool airQualityFetch() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("air: no Wi-Fi, keeping the previous reading");
+    return false;
+  }
+
+  const String url =
+      String("http://air-quality-api.open-meteo.com/v1/air-quality?latitude=") +
+      WEATHER_LAT + "&longitude=" + WEATHER_LON +
+      "&current=european_aqi,uv_index";
+
+  String body;
+  if (!httpGet("air", url, &body)) return false;
+
+  // `"current":{` again; `"current_units":{` carries the same two keys as
+  // strings, which scalarField() reads as absent.
+  const char *current = objectStart(body.c_str(), "current");
+  const float aqi = scalarField(current, "european_aqi");
+  const float uv = scalarField(current, "uv_index");
+  // An answer with neither is not worth overwriting the last good one with; a
+  // null in one of them only blanks that one.
+  if (isnan(aqi) && isnan(uv)) {
+    Serial.printf("air: unparsable answer (%u bytes)\n",
+                  (unsigned)body.length());
+    return false;
+  }
+  s_now.aqi = aqi;
+  s_now.uv = uv;
+
+  Serial.printf("air: european AQI %.0f, UV index %.1f\n", aqi, uv);
   return true;
 }
 

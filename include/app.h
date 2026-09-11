@@ -89,12 +89,21 @@ struct WeatherNow {
   float temp;      // degrees C
   float humidity;  // % RH
   float pressure;  // hPa at the station's altitude, not reduced to sea level
+  // These two come from Open-Meteo's air-quality service, by a request of
+  // their own (airQualityFetch), and stay NAN until it has answered once.
+  float aqi;       // European AQI: 0-20 good, 20-40 fair ... over 100 extreme
+  float uv;        // UV index
 };
 
 // Fetches the next WEATHER_HOURS hours from Open-Meteo. Requires a live Wi-Fi
 // connection; the caller owns the radio. On failure the previous forecast is
 // kept, so the panel shows stale data rather than nothing.
 bool weatherFetch();
+
+// Fetches the European air quality index and the UV index for the same place
+// into weatherNow()'s aqi and uv. Same terms as weatherFetch(): live Wi-Fi,
+// the caller owns the radio, and a failure keeps the previous reading.
+bool airQualityFetch();
 
 // True once a fetch has succeeded at least since boot.
 bool weatherValid();

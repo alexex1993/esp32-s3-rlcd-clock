@@ -17,8 +17,9 @@
 //
 //   * re-disciplines the RTC from NTP, whose crystal drifts a few seconds a
 //     day on its own, and
-//   * pulls the current conditions, the next twelve hours of weather and
-//     today's sunset for Brateevo (see weather.cpp).
+//   * pulls the current conditions, the air quality and UV index, the next
+//     twelve hours of weather and today's sunset for Brateevo (see
+//     weather.cpp).
 //
 // Both ride the same window on purpose: the radio is the expensive part, and
 // the panel is unreadable-stale for as long as it is up.
@@ -216,6 +217,10 @@ static bool syncOnline(bool *timeSynced) {
   // The forecast is fetched second: it is stamped with the local time, and by
   // now that is the time NTP just handed over rather than yesterday's drift.
   const bool weatherOk = weatherFetch();
+  // Left out of the verdict on purpose: two numbers from a second service are
+  // not worth reopening the window every sixty seconds while it is down. The
+  // next scheduled window simply asks again.
+  airQualityFetch();
 
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
@@ -408,8 +413,8 @@ static void handleConsole() {
       }
       WeatherNow now;
       if (weatherNow(&now)) {
-        Serial.printf(", outdoor %.1f C / %.0f%% RH / %.0f hPa", now.temp,
-                      now.humidity, now.pressure);
+        Serial.printf(", outdoor %.1f C / %.0f%% RH / %.0f hPa, AQI %.0f, UV %.1f",
+                      now.temp, now.humidity, now.pressure, now.aqi, now.uv);
       }
       Serial.printf(", forecast %s, sunset %s",
                     weatherValid() ? weatherStamp() : "none",
