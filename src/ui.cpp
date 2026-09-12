@@ -581,6 +581,7 @@ static void drawForecast(const UiState &s) {
 // file, so these do too.
 static const char kNewsHeading[] = "В МИРЕ";
 static const char kPagerHeading[] = "ПЕЙДЖЕР";
+static const char kPcHeading[] = "КОМПЬЮТЕР";
 
 // Splits `s` into at most maxLines lines no wider than maxW pixels, breaking
 // on spaces; the caller has already selected the font. Returns the line count.
@@ -876,7 +877,260 @@ static void drawPagerScreen(const UiState &s) {
   why = "нет SOCKS5_HOST в .env";
 #endif
   drawFeedScreen(s, kPagerHeading, pagerItems(), pagerCount(), PAGER_MAX_LINES,
-                 PAGER_META_LINE, footer, why, "ЧАСЫ");
+                 PAGER_META_LINE, footer, why, kPcHeading);
+}
+
+// --- the PC screen --------------------------------------------------------
+// The gaming PC's telemetry, from rtss_api (see rtss.cpp). The same bar and
+// footer as the two lists, so KEY does not make the panel jump. Between them:
+//
+//   0..25    bar: heading, HH:MM, battery
+//   34..108  the frame rate huge on the left
+//   118..194 the frame rate over the last 95 seconds, newest on the right
+//   205..276 a row each for GPU, CPU and VMEM, in four columns: load or
+//            memory in use, temperature, core or memory clock, power
+//   282      rule, then the session on the left and what KEY does next
+//
+// The frame rate is what gets read at a glance in the middle of a game, so it
+// keeps the largest type on the panel. The graph under it is for what one
+// number cannot show: a stutter, a loading screen, a scene that tanks. The
+// readings are rows rather than the tiles they started as because a row costs
+// a third of a tile's height, and that is where the graph's height came from.
+// Each column's numbers are right-aligned to the widest value it normally
+// shows, so the digits line up down the table and nothing shifts sideways when
+// a reading comes or goes.
+
+static const int PC_FPS_BASE = 108;
+static const int PC_GRAPH_TOP = 118;
+static const int PC_GRAPH_BOTTOM = 194;  // the baseline: no frames at all
+static const int PC_GRAPH_STEP = 2;      // px per sample
+static const int PC_ROW_BASE = 224;
+static const int PC_ROW_LEAD = 26;
+static const int PC_TIE = 3;  // between a number and its unit
+static const int PC_ROWS = 3;
+static const int PC_COLS = 4;
+
+// rtss.cpp keeps exactly as many samples as the graph is wide.
+static_assert((W - 2 * FEED_PAD) / PC_GRAPH_STEP == PC_FPS_HISTORY,
+              "PC_FPS_HISTORY in app.h is the graph's width in samples");
+
+namespace {
+
+// One cell of the table. A cell with no unit is one the row has no such
+// reading for at all — the CPU has no core clock here — and is left blank,
+// which is not the same as a reading the PC does not have right now: "--".
+struct PcCell {
+  float value;              // NAN for "--"
+  const uint8_t *unitFont;  // helv for "°C" and "%", Cyrillic for the rest
+  const char *unit;         // null for a blank cell
+  int decimals;             // gigabytes to a tenth, everything else whole
+};
+
+}  // namespace
+
+// A reading to `decimals` places, or "--" for one the PC does not have.
+static void formatReading(char *buf, size_t cap, float v, int decimals) {
+  if (isnan(v)) {
+    snprintf(buf, cap, "--");
+  } else if (decimals > 0) {
+    snprintf(buf, cap, "%.*f", decimals, v);
+  } else {
+    snprintf(buf, cap, "%ld", lroundf(v));
+  }
+}
+
+// The frame rate over what rtss.cpp has kept, newest against the right edge,
+// filled down to the baseline: at 1 bpp a solid shape reads from across a
+// desk where a one-pixel line does not. Between two samples the columns step
+// from one value to the next, so a change is a slope rather than a stair.
+//
+// The scale is the peak on screen rounded up past the next multiple of 30, so
+// a game held at 60 sits two thirds of the way up rather than pressed flat
+// against the top, and the scale moves only when the peak crosses a step. Its
+// value sits in the top-left corner, knocked out of the oldest samples. A
+// missing sample — no game, or a stretch the PC did not answer for — is left
+// empty rather than joined across.
+static void drawPcGraph() {
+  // Static, like the list screens' lines: only the loop task ever draws.
+  static float v[PC_FPS_HISTORY];
+  const int n = pcFpsHistory(v, PC_FPS_HISTORY);
+
+  float peak = 0.0f;
+  for (int i = 0; i < n; i++) {
+    if (!isnan(v[i]) && v[i] > peak) peak = v[i];
+  }
+  // Capped only so that the conversion to int is defined whatever arrives.
+  if (peak > 9000.0f) peak = 9000.0f;
+  const int top = ((int)peak / 30 + 1) * 30;
+  const int h = PC_GRAPH_BOTTOM - PC_GRAPH_TOP;
+  const int right = W - FEED_PAD;
+
+  for (int i = 0; i < n; i++) {
+    if (isnan(v[i])) continue;
+    const float from = (i > 0 && !isnan(v[i - 1])) ? v[i - 1] : v[i];
+    const int x0 = right - (n - i) * PC_GRAPH_STEP;
+    for (int k = 0; k < PC_GRAPH_STEP; k++) {
+      float at = from + (v[i] - from) * (float)(k + 1) / PC_GRAPH_STEP;
+      if (at > (float)top) at = (float)top;  // only past the cap above
+      const int px = (int)lroundf(at * (float)h / (float)top);
+      if (px > 0) lcd.drawVLine(x0 + k, PC_GRAPH_BOTTOM - px, px);
+    }
+  }
+
+  for (int x = FEED_PAD; x < right; x += 3) lcd.drawPixel(x, PC_GRAPH_TOP);
+  lcd.drawHLine(FEED_PAD, PC_GRAPH_BOTTOM, W - 2 * FEED_PAD);
+
+  char label[8];
+  snprintf(label, sizeof(label), "%d", top);
+  lcd.setFont(u8g2_font_helvB10_tf);
+  lcd.setDrawColor(0);
+  lcd.drawBox(FEED_PAD, PC_GRAPH_TOP + 1, lcd.getStrWidth(label) + 4, 14);
+  lcd.setDrawColor(1);
+  lcd.drawStr(FEED_PAD, PC_GRAPH_TOP + 13, label);
+}
+
+// GPU, CPU and VMEM as rows. Each column is as wide as its widest number and
+// its widest unit, the names take the width of "VMEM", and whatever is left
+// of the panel's width is shared out between the gaps, so the table spans the
+// panel whatever the fonts measure. A number wider than its column's widest
+// grows left into the gap before it rather than knocking its unit out of line.
+static void drawPcTable(const PcMetrics &m) {
+  const uint8_t *const num = u8g2_font_helvB18_tf;
+  // "°C" and "%" in helv, which has the degree sign; the Russian units in the
+  // largest Cyrillic face, which does not.
+  const uint8_t *const helv = u8g2_font_helvB14_tf;
+  const uint8_t *const cyr = u8g2_font_10x20_t_cyrillic;
+  static const char kDeg[] = "\xC2\xB0" "C";
+  const PcCell blank = {NAN, nullptr, nullptr, 0};
+
+  static const char *const kNames[PC_ROWS] = {"GPU", "CPU", "VMEM"};
+  // Video memory in use is up to tens of gigabytes to a tenth, which is wider
+  // than 100 %. 100 °C is a desktop CPU at its limit rather than a fault, and
+  // both the core clock and the memory clock are four digits of MHz.
+  static const char *const kWidest[PC_COLS] = {"88.8", "100", "8888", "888"};
+  const PcCell rows[PC_ROWS][PC_COLS] = {
+      {{m.gpuLoad, helv, "%", 0}, {m.gpuTemp, helv, kDeg, 0},
+       {m.gpuClock, cyr, "МГц", 0}, {m.gpuPower, cyr, "Вт", 0}},
+      {{m.cpuLoad, helv, "%", 0}, {m.cpuTemp, helv, kDeg, 0}, blank,
+       {m.cpuPower, cyr, "Вт", 0}},
+      {{m.vramUsed / 1024.0f, cyr, "ГБ", 1}, blank,
+       {m.vramClock, cyr, "МГц", 0}, blank},
+  };
+
+  lcd.setFont(cyr);
+  int nameW = 0;
+  for (int r = 0; r < PC_ROWS; r++) {
+    const int w = lcd.getUTF8Width(kNames[r]) + 1;  // +1: drawBoldUTF8
+    if (w > nameW) nameW = w;
+  }
+
+  int numW[PC_COLS], unitW[PC_COLS];
+  int used = nameW;
+  for (int c = 0; c < PC_COLS; c++) {
+    lcd.setFont(num);
+    numW[c] = lcd.getUTF8Width(kWidest[c]);
+    unitW[c] = 0;
+    for (int r = 0; r < PC_ROWS; r++) {
+      if (rows[r][c].unit == nullptr) continue;
+      lcd.setFont(rows[r][c].unitFont);
+      const int w = lcd.getUTF8Width(rows[r][c].unit);
+      if (w > unitW[c]) unitW[c] = w;
+    }
+    used += numW[c] + PC_TIE + unitW[c];
+  }
+  const int gap = (W - 2 * FEED_PAD - used) / PC_COLS;
+
+  int numRight[PC_COLS];
+  int x = FEED_PAD + nameW;
+  for (int c = 0; c < PC_COLS; c++) {
+    x += gap + numW[c];
+    numRight[c] = x;
+    x += PC_TIE + unitW[c];
+  }
+
+  char buf[12];
+  for (int r = 0; r < PC_ROWS; r++) {
+    const int base = PC_ROW_BASE + r * PC_ROW_LEAD;
+    lcd.setFont(cyr);
+    drawBoldUTF8(FEED_PAD, base, kNames[r]);
+    for (int c = 0; c < PC_COLS; c++) {
+      const PcCell &cell = rows[r][c];
+      if (cell.unit == nullptr) continue;
+      formatReading(buf, sizeof(buf), cell.value, cell.decimals);
+      lcd.setFont(num);
+      drawRight(buf, numRight[c], base);
+      drawRun(numRight[c] + PC_TIE, base, cell.unitFont, cell.unit);
+    }
+  }
+}
+
+static void drawPcFps(const PcMetrics &m) {
+  char now[12];
+  formatReading(now, sizeof(now), m.fps, 0);
+
+  const int x = drawRun(FEED_PAD, PC_FPS_BASE, u8g2_font_logisoso62_tn, now);
+  lcd.setFont(u8g2_font_helvB14_tf);
+  lcd.drawUTF8(x + 8, PC_FPS_BASE, "FPS");
+  if (!m.game) {
+    // On the desktop RTSS has nothing to count, which is not a fault.
+    lcd.setFont(u8g2_font_9x15_t_cyrillic);
+    lcd.drawUTF8(x + 8, PC_FPS_BASE - 26, "нет игры");
+  }
+}
+
+static void drawPcScreen(const UiState &s) {
+  drawFeedBar(s, kPcHeading);
+
+  // The session on the left, and where the numbers come from when the
+  // address still fits beside "KEY: ЧАСЫ".
+  char footer[64];
+  if (s.busy) {
+    snprintf(footer, sizeof(footer), "подключаюсь...");
+  } else {
+    snprintf(footer, sizeof(footer), "%s", pcStatus());
+#ifdef PC_ENABLED
+    char withHost[sizeof(footer)];
+    snprintf(withHost, sizeof(withHost), "%s  %s:%u", pcStatus(), pcHost(),
+             (unsigned)pcPort());
+    lcd.setFont(u8g2_font_6x12_t_cyrillic);
+    if (FEED_PAD + lcd.getUTF8Width(withHost) + 16 +
+            lcd.getUTF8Width("KEY: ЧАСЫ") <= W - FEED_PAD) {
+      memcpy(footer, withHost, sizeof(footer));
+    }
+#endif
+  }
+
+  PcMetrics m;
+  if (s.busy || !pcMetrics(&m)) {
+    // No sample recent enough to show as a reading. Which reason it is
+    // decides what there is to go and fix — the PC is off, rtss_api is not
+    // running, Wi-Fi is down — so the reason is what goes on the panel.
+    const char *why;
+    if (s.busy) {
+      why = "подключаюсь к ПК...";
+    } else if (pcError() != nullptr) {
+      why = pcError();
+    } else if (pcLive()) {
+      why = "жду данных от ПК...";
+    } else {
+      why = "подключаюсь к ПК...";
+    }
+#ifndef WIFI_SSID
+    why = "нет учётных данных Wi-Fi в .env";
+#elif !defined(RTSS_HOST)
+    why = "нет RTSS_HOST в .env";
+#endif
+    lcd.setFont(u8g2_font_9x15_t_cyrillic);
+    drawCentered(why, W / 2, 150);
+    drawFeedFooter(footer, "ЧАСЫ");
+    return;
+  }
+
+  drawPcFps(m);
+  drawPcGraph();
+  drawPcTable(m);
+
+  drawFeedFooter(footer, "ЧАСЫ");
 }
 
 void uiDraw(const UiState &s) {
@@ -888,6 +1142,9 @@ void uiDraw(const UiState &s) {
       break;
     case UI_SCREEN_PAGER:
       drawPagerScreen(s);
+      break;
+    case UI_SCREEN_PC:
+      drawPcScreen(s);
       break;
     default:
       drawStatusBar(s);

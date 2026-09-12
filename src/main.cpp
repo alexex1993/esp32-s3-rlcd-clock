@@ -29,9 +29,9 @@
 // wear. The SHTC3 is still on the bus and still readable with "?" at the
 // console — it is simply not on the panel.
 //
-// KEY (GPIO18) steps through three screens — the clock, the world headlines
-// and the Telegram pager — and the clock comes back on its own after
-// SCREEN_HOLD_MS.
+// KEY (GPIO18) steps through four screens — the clock, the world headlines,
+// the Telegram pager and the gaming PC's telemetry — and the clock comes back
+// on its own from the headlines after SCREEN_HOLD_MS.
 //
 // Both lists come up *only* on the way into their screen: there is no timer
 // behind either and they take no part in the sync window above. So the radio
@@ -52,9 +52,16 @@
 // reachable from here directly, so the proxy is not optional and the screen
 // says so when .env does not configure one. See telegram.cpp and socks5.cpp.
 //
+// The PC screen is the second session. It holds Wi-Fi and one keep-alive HTTP
+// connection to rtss_api on the gaming PC (RTSS_HOST in .env) and puts a fresh
+// sample of the GPU, CPU, memory and frame rate on the panel twice a second —
+// see rtss.cpp. Like the pager it stays up until KEY moves on, and while it is
+// up it keeps asking for the network back if Wi-Fi drops. Stepping from the
+// pager straight to it keeps the radio up across the switch.
+//
 // Credentials come from .env in the project root (SSID= / PWD= / NEWS_API= /
-// TOKEN_BOT= / SOCKS5_*), which scripts/env_flags.py turns into -D macros at
-// build time.
+// TOKEN_BOT= / SOCKS5_* / RTSS_HOST=), which scripts/env_flags.py turns into
+// -D macros at build time.
 //
 // Console: the single Type-C socket is the S3's native USB and there is no
 // UART bridge chip, so -DARDUINO_USB_MODE=1 and -DARDUINO_USB_CDC_ON_BOOT=1
@@ -297,21 +304,68 @@ static void refreshNews() {}
 size_t getArduinoLoopTaskStackSize() { return 12 * 1024; }
 
 // The pager holds the radio for as long as its screen is up — that is the
-// whole point of it, and the reason it is the one screen that does not time
-// out back to the clock. It costs perhaps 80 mA of the 18650 while it is
-// open, which is why nothing opens it but a deliberate press of KEY.
+// whole point of it, and the reason it does not time out back to the clock.
+// It costs perhaps 80 mA of the 18650 while it is open, which is why nothing
+// opens it but a deliberate press of KEY.
 static void pagerStart() {
   if (!radioUp("pager")) return;
   pagerOpen();
 }
-
-static void pagerStop() {
-  pagerClose();
-  radioDown();
-}
 #else
 static void pagerStart() {}
-static void pagerStop() {}
+#endif
+
+// --- the PC session -------------------------------------------------------
+
+#ifdef PC_ENABLED
+// How long Wi-Fi may stay gone with the PC screen up before it is asked for
+// again. Longer than a join takes, so a rejoin already under way is not
+// interrupted by the next one.
+static const uint32_t WIFI_REJOIN_MS = 20000;
+
+// Unlike the pager, the session opens whether or not Wi-Fi came up: this
+// screen is meant to stay connected, and pcKeepRadio() goes on asking for the
+// network for as long as it is up.
+static void pcStart() {
+  radioUp("pc");
+  pcOpen();
+}
+
+// The core rejoins by itself after most drops — a lost beacon, a roaming AP —
+// but not after every one, and not at all once radioUp() has given up and
+// switched the radio off. So while the screen is up, a network that has been
+// gone for WIFI_REJOIN_MS is asked for again, without waiting on it: the
+// session in rtss.cpp notices when it is back.
+static void pcKeepRadio() {
+  static uint32_t s_wifiSeenMs = 0;
+  if (WiFi.status() == WL_CONNECTED) {
+    s_wifiSeenMs = millis();
+    return;
+  }
+  if (millis() - s_wifiSeenMs < WIFI_REJOIN_MS) return;
+  s_wifiSeenMs = millis();
+  Serial.println("pc: wifi is down, rejoining");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+}
+#else
+static void pcStart() {}
+static void pcKeepRadio() {}
+#endif
+
+#ifdef WIFI_SSID
+// The screens that keep Wi-Fi up for as long as they are showing: the two
+// sessions, where this build has them.
+static bool holdsRadio(UiScreen screen) {
+#ifdef PAGER_ENABLED
+  if (screen == UI_SCREEN_PAGER) return true;
+#endif
+#ifdef PC_ENABLED
+  if (screen == UI_SCREEN_PC) return true;
+#endif
+  (void)screen;
+  return false;
+}
 #endif
 
 // --- sensors --------------------------------------------------------------
@@ -386,7 +440,10 @@ static void handleConsole() {
           delay(10);
         }
         if (pagerResponses() == before) Serial.println("pager: gave up waiting");
-        pagerStop();
+        // Typed on the PC screen, the radio stays: that screen's own session
+        // is still riding the link a diagnostic borrowed.
+        pagerClose();
+        if (!holdsRadio(s_screen)) radioDown();
         forceRedraw();
       } else {
         radioDown();
@@ -430,6 +487,12 @@ static void handleConsole() {
                     (unsigned long)pagerResponses());
       Serial.printf(", proxy %s:%u", socks5Host(), (unsigned)socks5Port());
 #endif
+#ifdef PC_ENABLED
+      Serial.printf(", pc %s after %lu answers from %s:%u",
+                    pcLive() ? "live" : "down", (unsigned long)pcResponses(),
+                    pcHost(), (unsigned)pcPort());
+      if (pcError() != nullptr) Serial.printf(" [%s]", pcError());
+#endif
       Serial.printf(", speaker %s", audioPresent() ? "ready" : "MISSING");
 #ifdef WIFI_SSID
       Serial.printf(", next sync in %ld s",
@@ -445,8 +508,9 @@ static void handleConsole() {
                      " P to read telegram now,"
 #endif
                      " B to test the speaker,"
-                     " ? for status; KEY steps clock -> news -> pager,"
-                     " and the pager stays up until KEY says otherwise");
+                     " ? for status; KEY steps clock -> news -> pager -> pc,"
+                     " and the pager and pc screens stay up until KEY says"
+                     " otherwise");
     }
   }
 }
@@ -542,10 +606,10 @@ void loop() {
 
 #ifdef WIFI_SSID
   // Signed difference, so the schedule survives the millis() rollover. Held
-  // off while the pager is up: that screen owns the radio and a sync window
-  // would tear its connection down under it, for a clock nobody is looking
-  // at just then.
-  if (s_screen == UI_SCREEN_PAGER) {
+  // off while a session screen is up: that screen owns the radio and a sync
+  // window would tear its connection down under it, for a clock nobody is
+  // looking at just then.
+  if (holdsRadio(s_screen)) {
     s_nextOnlineMs = nowMs + ONLINE_RETRY_MS;
   } else if ((int32_t)(nowMs - s_nextOnlineMs) >= 0) {
     bool timeSynced = false;
@@ -571,13 +635,19 @@ void loop() {
   const bool keyDown = digitalRead(PIN_BTN_KEY) == LOW;
   if (keyDown && !keyWasDown && (nowMs - keyLastMs) >= KEY_DEBOUNCE_MS) {
     keyLastMs = nowMs;
-    const bool wasPager = (s_screen == UI_SCREEN_PAGER);
+    const UiScreen was = s_screen;
     s_screen = (UiScreen)((s_screen + 1) % UI_SCREEN_COUNT);
     readBattery();
 
-    // Leaving the pager always drops its connection and its radio, whichever
-    // screen is next.
-    if (wasPager) pagerStop();
+    // Leaving a session screen always ends its session. The radio goes down
+    // with it unless the next screen is a session too and would only have to
+    // bring it straight back up — which is how the pager hands it to the PC
+    // screen without a second wait for Wi-Fi.
+    if (was == UI_SCREEN_PAGER) pagerClose();
+    if (was == UI_SCREEN_PC) pcClose();
+#ifdef WIFI_SSID
+    if (holdsRadio(was) && !holdsRadio(s_screen)) radioDown();
+#endif
 
     if (s_screen != UI_SCREEN_CLOCK) {
       // Bringing the radio up takes seconds and the panel is frozen for every
@@ -590,8 +660,10 @@ void loop() {
       s_ui.busy = false;
       if (s_screen == UI_SCREEN_NEWS) {
         refreshNews();
-      } else {
+      } else if (s_screen == UI_SCREEN_PAGER) {
         pagerStart();
+      } else {
+        pcStart();
       }
     }
     // Started after the radio came up, not before it: the hold is time to
@@ -601,12 +673,13 @@ void loop() {
   }
   keyWasDown = keyDown;
 
-  // The news screen never stays up for good; the pager does. Standing there
-  // watching for a message is the whole reason the pager exists, and a screen
-  // that folded itself away after 45 seconds would be useless for it — so it
-  // stays until KEY says otherwise. millis() rather than nowMs, which a fetch
-  // just above may have left seconds behind: stale, it would read as a huge
-  // elapsed time and bounce straight back to the clock.
+  // The news screen never stays up for good; the pager and the PC screen do.
+  // Standing there watching for a message, or glancing at a frame rate, is
+  // the whole reason either exists, and a screen that folded itself away
+  // after 45 seconds would be useless for it — so both stay until KEY says
+  // otherwise. millis() rather than nowMs, which a fetch just above may have
+  // left seconds behind: stale, it would read as a huge elapsed time and
+  // bounce straight back to the clock.
   if (s_screen == UI_SCREEN_NEWS && millis() - s_screenMs >= SCREEN_HOLD_MS) {
     s_screen = UI_SCREEN_CLOCK;
     forceRedraw();
@@ -622,6 +695,13 @@ void loop() {
     // third of a second.
     chirp = pagerTakeArrival();
     if (chirp) forceRedraw();
+  }
+
+  // The PC screen: a sample twice a second, and the network kept up under it.
+  // Nothing in here waits on the PC, so a switched-off one does not cost KEY.
+  if (s_screen == UI_SCREEN_PC) {
+    pcKeepRadio();
+    if (pcPoll()) forceRedraw();
   }
 
   // The RTC sits on a 100 kHz bus and a read is about a millisecond. On the
@@ -674,7 +754,11 @@ void loop() {
   // arrive together.
   if (chirp) audioNotify();
 
-  // The pager watches a socket rather than a clock, so it is polled as fast
-  // as the loop runs; every other screen only ever changes once a second.
-  delay(s_screen == UI_SCREEN_PAGER ? 5 : 50);
+  // The two session screens watch a socket rather than a clock, so they are
+  // polled fast; every other screen only ever changes once a second. The
+  // PC's answers are 72 bytes twice a second, which 10 ms keeps up with.
+  uint32_t pace = 50;
+  if (s_screen == UI_SCREEN_PAGER) pace = 5;
+  if (s_screen == UI_SCREEN_PC) pace = 10;
+  delay(pace);
 }

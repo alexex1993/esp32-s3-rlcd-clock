@@ -10,9 +10,14 @@
 #     SOCKS5_PORT=1080
 #     SOCKS5_USER=someone
 #     SOCKS5_PASSWORD=secret
+#     RTSS_HOST=192.168.0.100
+#     RTSS_PORT=8099
 #
 # WIFI_SSID / WIFI_PASS are accepted as key names too, as is NEWS_API_KEY for
 # the news one and BOT_TOKEN for the Telegram one. Values may be quoted.
+# RTSS_HOST may also carry its port, and even the scheme, as it would be
+# pasted from a browser ("http://192.168.0.100:8099"); an explicit RTSS_PORT
+# wins over the one in the host.
 # Nothing is read from the process environment: "PWD" there is the shell's
 # current directory, which would silently become the Wi-Fi password.
 #
@@ -22,7 +27,8 @@
 #   * no SSID means no radio at all,
 #   * NEWS_API_KEY missing only costs the world-news screen,
 #   * TELEGRAM_BOT_TOKEN or SOCKS5_HOST missing only costs the pager screen,
-#     which is deliberately proxy-only -- see socks5.cpp.
+#     which is deliberately proxy-only -- see socks5.cpp,
+#   * RTSS_HOST missing only costs the PC screen.
 #
 # With no .env at all the build still succeeds and the clock is set by hand at
 # the console.
@@ -52,9 +58,12 @@ ALIASES = {
     "SOCKS5_USER": "SOCKS5_USER",
     "SOCKS5_PASSWORD": "SOCKS5_PASS",
     "SOCKS5_PASS": "SOCKS5_PASS",
+    "RTSS_HOST": "RTSS_HOST",
+    "RTSS_PORT": "RTSS_PORT",
 }
 
-# Printed by name only; the values are secrets.
+# Passed as string literals. Echoed by name only, apart from the SSID and the
+# two hosts below; the rest are secrets.
 MACROS = (
     "WIFI_SSID",
     "WIFI_PASS",
@@ -63,10 +72,11 @@ MACROS = (
     "SOCKS5_HOST",
     "SOCKS5_USER",
     "SOCKS5_PASS",
+    "RTSS_HOST",
 )
 
-# The one value the firmware wants as a number rather than a string literal.
-NUMERIC = ("SOCKS5_PORT",)
+# The values the firmware wants as numbers rather than string literals.
+NUMERIC = ("SOCKS5_PORT", "RTSS_PORT")
 
 
 def read_env_file(path):
@@ -89,7 +99,26 @@ def read_env_file(path):
     return values
 
 
+def split_rtss_host(values):
+    """Accepts RTSS_HOST as a bare address, host:port, or a pasted URL."""
+    host = values.get("RTSS_HOST")
+    if not host:
+        return
+    if host.lower().startswith("http://"):
+        host = host[len("http://"):]
+    host = host.split("/", 1)[0]
+    name, sep, port = host.partition(":")
+    if sep and port.isdigit():
+        host = name
+        values.setdefault("RTSS_PORT", port)
+    if host:
+        values["RTSS_HOST"] = host
+    else:
+        del values["RTSS_HOST"]
+
+
 creds = read_env_file(ENV_FILE)
+split_rtss_host(creds)
 
 defines = [
     (name, env.StringifyMacro(creds[name])) for name in MACROS if name in creds
@@ -132,3 +161,11 @@ elif "TELEGRAM_BOT_TOKEN" in creds:
     print("env_flags: no SOCKS5_HOST in .env, building without the pager screen")
 else:
     print("env_flags: no TOKEN_BOT in .env, building without the pager screen")
+
+if "RTSS_HOST" in creds:
+    print(
+        "env_flags: PC telemetry from rtss_api at http://%s:%s"
+        % (creds["RTSS_HOST"], creds.get("RTSS_PORT", "8099 (default)"))
+    )
+else:
+    print("env_flags: no RTSS_HOST in .env, building without the PC screen")

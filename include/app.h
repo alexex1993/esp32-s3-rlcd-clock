@@ -10,18 +10,26 @@
 
 // --- what this build can reach --------------------------------------------
 // scripts/env_flags.py turns .env into these; each one gates a different
-// amount of the firmware, and all four branches must still build.
+// amount of the firmware, and every branch must still build.
 //
 //   WIFI_SSID           the whole networking half
 //   NEWS_API_KEY        the world-news screen
 //   TELEGRAM_BOT_TOKEN  }  the pager screen, which is proxy-only on purpose:
 //   SOCKS5_HOST         }  api.telegram.org is not reachable directly here.
+//   RTSS_HOST           the PC screen: rtss_api on the gaming PC, on the LAN
 #if defined(WIFI_SSID) && defined(TELEGRAM_BOT_TOKEN) && defined(SOCKS5_HOST)
 #define PAGER_ENABLED 1
-// The port is the only .env value that arrives as a number rather than a
-// string literal, and the SOCKS5 default is the one to fall back on.
+// The ports are the only .env values that arrive as numbers rather than
+// string literals, and each falls back on its protocol's default.
 #ifndef SOCKS5_PORT
 #define SOCKS5_PORT 1080
+#endif
+#endif
+
+#if defined(WIFI_SSID) && defined(RTSS_HOST)
+#define PC_ENABLED 1
+#ifndef RTSS_PORT
+#define RTSS_PORT 8099  // rtss_api's own default, its -addr flag
 #endif
 #endif
 
@@ -289,6 +297,81 @@ const char *pagerStamp();
 // things to go and fix.
 const char *pagerError();
 
+// --- rtss.cpp -------------------------------------------------------------
+
+// Live telemetry from the gaming PC: what RTSS and MSI Afterburner publish for
+// their own overlay, read off rtss_api's /api/v1/metrics.bin on the LAN (see
+// README_RTSS.md for the server).
+//
+// A reading the PC does not have is NAN, whatever sentinel the wire used for
+// it: Afterburner not running, a sensor not ticked on its Monitoring tab, no
+// 3D application in the foreground for the frame rate. So the panel can put
+// "--" in exactly the place that is missing.
+struct PcMetrics {
+  float gpuTemp;    // degrees C
+  float gpuLoad;    // %
+  float gpuClock;   // MHz, the core clock
+  float gpuPower;   // W
+  float cpuTemp;    // degrees C
+  float cpuLoad;    // %, all cores together
+  float cpuPower;   // W
+  float vramClock;  // MHz, the video memory clock
+  float vramUsed;   // MB, the video memory in use
+  float fps;       // frames per second, now
+  bool game;        // RTSS has a 3D application to report on
+};
+
+// How many frame-rate samples the graph keeps: one per answer, so twice a
+// second. Sized from ui.cpp's layout, which checks it — the graph is 380 px
+// wide at 2 px a sample, so this is the last 95 seconds.
+#define PC_FPS_HISTORY 190
+
+// Like the pager, a *session* rather than a fetch: the connection to the PC
+// is held for as long as the screen is up and a fresh sample is asked for
+// twice a second. The caller owns the radio and keeps Wi-Fi up meanwhile.
+
+// Marks the session as wanting to be up. The connection is started on the
+// first pcPoll(), so the caller can put a frame on the panel first.
+void pcOpen();
+
+// Drives the session. Call once per pass through loop() while the PC screen
+// is up. Returns true when something the panel shows has changed. Never
+// blocks: the connect and the answer are both watched, not waited on.
+bool pcPoll();
+
+// Tears the connection down.
+void pcClose();
+
+// True while connected, whether or not an answer is outstanding.
+bool pcLive();
+
+// The latest sample, if there is one recent enough to show as current.
+// False otherwise, and then pcError() usually says why.
+bool pcMetrics(PcMetrics *out);
+
+// The newest frame-rate samples, up to `cap` of them, oldest first, and how
+// many there were. NAN is a sample with no frame rate — no game — or one the
+// PC did not answer for, so the graph leaves a gap there rather than joining
+// across it. Kept for the visit only: the screen opens on an empty graph.
+int pcFpsHistory(float *out, int cap);
+
+// Answers read since boot, for the console.
+uint32_t pcResponses();
+
+// A short Russian phrase for the footer: what the session is doing.
+const char *pcStatus();
+
+// Why the last attempt failed, as a short Russian phrase for the panel, or
+// null if it did not. A PC that is switched off and a PC with rtss_api not
+// running look the same otherwise, and are different things to go and fix.
+const char *pcError();
+
+#ifdef PC_ENABLED
+// Where the samples come from, for the footer and the console.
+const char *pcHost();
+uint16_t pcPort();
+#endif
+
 // --- ui.cpp ---------------------------------------------------------------
 
 // What the panel is currently showing. KEY steps through these in order and
@@ -297,6 +380,7 @@ enum UiScreen {
   UI_SCREEN_CLOCK = 0,
   UI_SCREEN_NEWS,
   UI_SCREEN_PAGER,
+  UI_SCREEN_PC,
   UI_SCREEN_COUNT,
 };
 
