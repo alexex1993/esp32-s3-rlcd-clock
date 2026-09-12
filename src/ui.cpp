@@ -7,7 +7,7 @@
 // 400 x 300, top to bottom:
 //
 //   0..25    status bar: date and a small battery gauge
-//   40..132  the clock, HH:MM huge with the seconds set alongside
+//   40..132  the clock, HH:MM huge and centred — no seconds, see drawClock
 //   144..158 outdoors right now: temperature, humidity, pressure, UV, air
 //   168      rule
 //   179..272 twelve hourly columns: hour, glyph, temperature, chance of rain
@@ -122,6 +122,32 @@ void displayBegin() {
   // uses.
   lcd.setBusClock(24000000);
   lcd.setContrast(0);  // no-op on this panel; there is no backlight to dim
+}
+
+// --- the panel's own two power modes --------------------------------------
+// The ST7305 refreshes what it holds entirely on its own: ~32 Hz in HPM
+// (0x38), ~1 Hz in LPM (0x39). The image survives either way, so on a face
+// that changes once a minute LPM is simply the cheaper place to rest. U8g2
+// wraps neither command, which is why they are sent raw here. Note that
+// setPowerSave(1) is *not* this: it sends 0x28, display off, and the image
+// goes away.
+//
+// Writing while in LPM is allowed, but the write can take a whole refresh
+// period to appear — a second of the wrong time on the glass for a clock that
+// updates on the minute boundary. So uiDraw() lifts the panel to HPM for the
+// write and puts it back where it found it.
+static const uint32_t LCD_SETTLE_MS = 10;  // after a mode change
+// One HPM refresh is ~31 ms, so this is the wait that guarantees the frame
+// just clocked in has actually been painted before the rate drops to 1 Hz.
+static const uint32_t LCD_FRAME_MS = 40;
+
+static bool s_lowPower = false;
+
+void displayLowPower(bool on) {
+  if (on == s_lowPower) return;
+  s_lowPower = on;
+  lcd.sendF("c", on ? 0x39 : 0x38);
+  delay(LCD_SETTLE_MS);
 }
 
 // --- small text helpers ---------------------------------------------------
@@ -385,29 +411,21 @@ static void drawStatusBar(const UiState &s) {
 }
 
 static void drawClock(const UiState &s) {
-  // HH:MM huge, with the seconds set much smaller on the same baseline so the
-  // minutes stay the thing you read from across the room.
-  char hm[8], ss[4];
+  // HH:MM and nothing beside it. The seconds used to sit on the same baseline
+  // at 42 px; they went with the power work, and what they cost was not the
+  // pixels but the schedule — a face carrying seconds has to be rewritten
+  // sixty times a minute, which is sixty 15 KB frames and a SoC that can
+  // never sleep. Everything main.cpp does between minutes depends on this
+  // function having nothing left on it that moves faster than tm_min.
+  char hm[8];
   snprintf(hm, sizeof(hm), "%02d:%02d", s.time.tm_hour, s.time.tm_min);
-  snprintf(ss, sizeof(ss), "%02d", s.time.tm_sec);
 
   // 92 px is the largest logisoso U8g2 ships, so HH:MM cannot grow any
   // further: "23:59" measures 271 px of the 400, and the 92 px ascent hangs
   // off a 132 px baseline, clear of both the 26 px status bar and the outdoor
-  // row below. The seconds carry the rest of the weight — at 42 px they read
-  // from across the room too, and still cannot be mistaken for the minutes.
+  // row below. Centred now that it has the row to itself.
   lcd.setFont(u8g2_font_logisoso92_tn);
-  const int wHM = lcd.getStrWidth(hm);
-  lcd.setFont(u8g2_font_logisoso42_tn);
-  const int wSS = lcd.getStrWidth(ss);
-
-  const int gap = 14;
-  const int x0 = (W - (wHM + gap + wSS)) / 2;
-
-  lcd.setFont(u8g2_font_logisoso92_tn);
-  lcd.drawStr(x0, CLOCK_BASE, hm);
-  lcd.setFont(u8g2_font_logisoso42_tn);
-  lcd.drawStr(x0 + wHM + gap, CLOCK_BASE, ss);
+  drawCentered(hm, W / 2, CLOCK_BASE);
 }
 
 // What it is doing outside, the whole width of the panel: temperature,
@@ -1134,6 +1152,13 @@ static void drawPcScreen(const UiState &s) {
 }
 
 void uiDraw(const UiState &s) {
+  // Whatever mode the panel was parked in, the frame goes out in HPM and the
+  // panel is put back afterwards: a write that lands in LPM can take a full
+  // second to appear. Drawing the buffer happens in between, which doubles as
+  // the settling time the mode change wants.
+  const bool wasLow = s_lowPower;
+  if (wasLow) displayLowPower(false);
+
   lcd.clearBuffer();
 
   switch (s.screen) {
@@ -1156,4 +1181,9 @@ void uiDraw(const UiState &s) {
   }
 
   lcd.sendBuffer();
+
+  if (wasLow) {
+    delay(LCD_FRAME_MS);  // let the frame be painted before the rate drops
+    displayLowPower(true);
+  }
 }

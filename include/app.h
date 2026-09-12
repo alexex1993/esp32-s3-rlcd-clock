@@ -401,6 +401,13 @@ struct UiState {
 
 void displayBegin();
 
+// Parks the ST7305 in its low-power mode (0x39, ~1 Hz self-refresh) or brings
+// it back to the high-power one (0x38, ~32 Hz). The panel holds its image in
+// both — this is not setPowerSave(), which sends 0x28 and turns the display
+// off. uiDraw() lifts the panel out of LPM for the write on its own, so a
+// caller only has to say which mode the screen it is showing should rest in.
+void displayLowPower(bool on);
+
 // Redraws the whole panel from the state above plus the module-owned forecast,
 // headlines and pages, choosing the layout from s.screen.
 void uiDraw(const UiState &s);

@@ -33,6 +33,20 @@
 // the Telegram pager and the gaming PC's telemetry — and the clock comes back
 // on its own from the headlines after SCREEN_HOLD_MS.
 //
+// The clock face is also the only screen that is built to be *cheap*, because
+// it is the one the thing spends its life on. It carries no seconds, so it is
+// rewritten once a minute rather than sixty times; the panel rests in its own
+// low-power mode between those writes; the CPU drops to 80 MHz; and the SoC
+// spends the minute in light sleep, waking just past the boundary with the new
+// value already in the RTC. KEY pulls GPIO18 low, which is the second wake
+// source, so the button is as live asleep as awake. Overnight — NIGHT_START_
+// HOUR to NIGHT_END_HOUR — the scheduled sync window is held off as well: a
+// forecast fetched between 1 and 7 is one nobody reads.
+//
+// None of that applies to the other three screens. They are what somebody is
+// standing in front of, and the pager and the PC screen are holding a socket
+// open besides, so they run at full rate.
+//
 // Both lists come up *only* on the way into their screen: there is no timer
 // behind either and they take no part in the sync window above. So the radio
 // comes up for a few seconds while you stand there waiting, which is why both
@@ -71,13 +85,18 @@
 
 #include "app.h"
 #include "board_pins.h"
+#include "driver/gpio.h"
+#include "esp_sleep.h"
 
 #ifdef WIFI_SSID
 #include <WiFi.h>
 #include "esp_sntp.h"
 #endif
 
-static const uint32_t BATTERY_PERIOD_MS = 10000;  // the cell does not move fast
+// Read once a minute rather than every ten seconds: the cell does not move
+// fast, and on the clock face every reading is a wake that would otherwise
+// not have happened.
+static const uint32_t BATTERY_PERIOD_MS = 60000;
 
 #ifdef WIFI_SSID
 static const uint32_t ONLINE_PERIOD_MS = 30UL * 60 * 1000;  // NTP + weather
@@ -93,25 +112,58 @@ static const uint32_t SCREEN_HOLD_MS = 45000;
 // Two presses closer together than this are one press bouncing.
 static const uint32_t KEY_DEBOUNCE_MS = 200;
 
+// --- what the clock face costs --------------------------------------------
+// Nearly all of it was the SoC being awake for a panel that changes once a
+// minute. The sleep at the foot of loop() is the answer to that; the rest of
+// these are the smaller levers around it.
+
+// The face is read to the minute, so the RTC is sampled to the second. Off
+// the clock face the sample is finer (250 ms in loop()), because there an
+// HH:MM in the bar sits over a screen being polled every 5 ms and stale reads
+// worse than cheap.
+static const uint32_t CLOCK_SAMPLE_MS = 1000;
+
+// The sleep aims just *past* the minute boundary rather than just before it:
+// one wake a minute that already has the new value, instead of two around it.
+static const uint32_t WAKE_OVERSHOOT_MS = 80;
+
+// Shorter than this and the entry and exit are not worth it, so the pass just
+// paces itself the ordinary way.
+static const uint32_t SLEEP_FLOOR_MS = 250;
+
+// 240 MHz is what the sessions want: the pager walks a certificate chain and
+// the PC screen parses an answer twice a second. The clock face needs none of
+// it. 80 is a floor rather than a tuning knob — below it the USB-Serial-JTAG
+// console stops working, and on this board that is the only console there is.
+static const uint32_t CPU_MHZ_IDLE = 80;
+static const uint32_t CPU_MHZ_BUSY = 240;
+
+#ifdef WIFI_SSID
+// The hours the sync window opens half as often. Not a window that stops: the
+// RTC wants disciplining whether or not anybody is awake for it, and a clock
+// that drifts overnight is the one fault this thing cannot have. What is not
+// worth the radio between 1 and 7 is the second forecast of each hour, which
+// nobody reads. Local time, which is what the RTC holds.
+static const int NIGHT_START_HOUR = 1;
+static const int NIGHT_END_HOUR = 7;
+static const uint32_t NIGHT_ONLINE_PERIOD_MS = 60UL * 60 * 1000;
+#endif
+
 static UiState s_ui;
 // Whether a trustworthy *source* has ever set the clock. s_ui.timeValid is the
 // narrower question the face asks — that, and the RTC still answering now.
 static bool s_timeValid = false;
-static int s_lastSecond = -1;
-// The list screens only tick once a minute, so they need their own memory of
-// what was last drawn; the clock's seconds are no use to them.
+// Every screen ticks on the minute now: the clock face joined the other three
+// when it gave up its seconds, and nothing on any of them moves faster.
 static int s_lastMinute = -1;
 static UiScreen s_screen = UI_SCREEN_CLOCK;
 static uint32_t s_screenMs = 0;
 static uint32_t s_lastBatteryMs = 0;
 static char s_note[32] = "";
 
-// Makes the next pass through loop() rewrite the panel, whichever of the two
-// clocks the screen that is up happens to watch.
-static void forceRedraw() {
-  s_lastSecond = -1;
-  s_lastMinute = -1;
-}
+// Makes the next pass through loop() rewrite the panel, whatever the minute
+// on it says.
+static void forceRedraw() { s_lastMinute = -1; }
 
 // --- time sources ---------------------------------------------------------
 
@@ -376,6 +428,91 @@ static void readBattery() {
   snprintf(s_note, sizeof(s_note), "%s", s_ui.percent <= 10 ? "НИЗКИЙ ЗАРЯД" : "");
 }
 
+// --- the clock the face is drawn from -------------------------------------
+
+// The RTC sits on a 100 kHz bus and a read is about a millisecond. That is
+// nothing once a second, but the pager runs the loop at 5 ms so it can watch
+// its socket, and reading the RTC every pass there would spend a fifth of the
+// CPU re-fetching a value that only feeds an HH:MM. So it is sampled on a
+// schedule of its own and in between the last reading stands. Pass 0 to force
+// one — after the sync window, which blocks for seconds.
+static struct tm s_clock;
+static bool s_clockRead = false;
+static bool s_clockOk = false;
+static uint32_t s_clockMs = 0;
+
+static void clockSample(uint32_t period) {
+  if (s_clockRead && (millis() - s_clockMs) < period) return;
+  s_clockMs = millis();
+  s_clockRead = true;
+  if (rtcPresent()) {
+    // A false here means the RTC lost power while running; s_timeValid stays
+    // the authority on whether the *source* was ever trustworthy.
+    s_clockOk = rtcReadTime(&s_clock);
+  } else {
+    // No RTC on the bus — fall back to the ESP's own clock, which applyTime()
+    // keeps in step whenever a real source turns up.
+    const time_t t = time(nullptr);
+    localtime_r(&t, &s_clock);
+    s_clockOk = true;
+  }
+}
+
+#ifdef WIFI_SSID
+// A clock that was never set has no night: the hour in it is whatever the
+// RTC's registers happened to hold, and stretching the sync window on that
+// would hide the one thing that could still fix it.
+static bool isNight(const struct tm &t, bool valid) {
+  return valid && t.tm_hour >= NIGHT_START_HOUR && t.tm_hour < NIGHT_END_HOUR;
+}
+#endif
+
+// --- how hard the SoC works -----------------------------------------------
+
+// The clock face is the screen this thing spends its life on, so it is the one
+// built to be cheap; the other three are what somebody is standing in front of.
+static void cpuForScreen(UiScreen screen) {
+  const uint32_t want =
+      (screen == UI_SCREEN_CLOCK) ? CPU_MHZ_IDLE : CPU_MHZ_BUSY;
+  if ((uint32_t)getCpuFrequencyMhz() != want) setCpuFrequencyMhz(want);
+}
+
+// The clock face's idle. Both cores stop, RAM and every peripheral keep their
+// state, the panel keeps its image, and two things bring it back: the timer,
+// and KEY pulling GPIO18 low. GPIO18 idles high through the board's own 10K
+// pull-up, so a level-triggered wake on low needs no extra hardware, and the
+// button is as live asleep as it is awake.
+//
+// Coming back is a *return from this function*, not a reset — the forecast,
+// the headlines, the Wi-Fi configuration and millis() all survive it, which is
+// the reason this is light sleep and not deep sleep. Deep sleep would cost a
+// full boot and a fresh sync window on every press of KEY, for a difference
+// this board's LDO and its four powered I2C slaves would mostly swallow.
+// esp_timer is resynchronised from the RTC across the sleep, so the sync
+// schedule is still true on the other side of it.
+static void clockSleep(uint32_t ms) {
+  // A level-triggered wake source that is already asserted returns from the
+  // sleep immediately, so a held-down KEY would spin here. Let loop() see the
+  // press instead.
+  if (digitalRead(PIN_BTN_KEY) == LOW) {
+    delay(10);
+    return;
+  }
+
+  gpio_wakeup_enable((gpio_num_t)PIN_BTN_KEY, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  esp_sleep_enable_timer_wakeup((uint64_t)ms * 1000ULL);
+
+  esp_light_sleep_start();
+
+  // Nothing is left armed: the session screens run at full rate with the radio
+  // up, and a wake source still attached to a button there is one nobody asked
+  // for.
+  gpio_wakeup_disable((gpio_num_t)PIN_BTN_KEY);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+}
+
 // "T2026-09-09 21:30:00" (the space may also be a 'T'), typed at the console.
 static void handleConsole() {
   static char line[64];
@@ -594,9 +731,15 @@ void setup() {
   s_ui.timeValid = s_timeValid;
   s_ui.screen = s_screen;
   uiDraw(s_ui);
-  s_lastSecond = s_ui.time.tm_sec;
   s_lastMinute = s_ui.time.tm_min;
   s_screenMs = millis();
+
+  // The board comes up on the clock face, so it comes up in that face's two
+  // cheap states. Both were left alone until here on purpose: the boot sync
+  // window above wanted the radio, and the first frame wanted the panel at
+  // full rate.
+  displayLowPower(true);
+  cpuForScreen(s_screen);
 }
 
 void loop() {
@@ -604,17 +747,30 @@ void loop() {
 
   const uint32_t nowMs = millis();
 
+  // Sampled before anything else needs it: the window below asks what hour it
+  // is, and the sleep at the foot asks how much of the minute is left.
+  clockSample(s_screen == UI_SCREEN_CLOCK ? CLOCK_SAMPLE_MS : 250);
+
 #ifdef WIFI_SSID
   // Signed difference, so the schedule survives the millis() rollover. Held
   // off while a session screen is up: that screen owns the radio and a sync
   // window would tear its connection down under it, for a clock nobody is
   // looking at just then.
+  //
+  // Which period follows a window is decided from the hour that window landed
+  // in, not the one it opened in — it blocks for seconds and can straddle
+  // 01:00 or 07:00 — so the clock is re-sampled first.
   if (holdsRadio(s_screen)) {
     s_nextOnlineMs = nowMs + ONLINE_RETRY_MS;
   } else if ((int32_t)(nowMs - s_nextOnlineMs) >= 0) {
     bool timeSynced = false;
     const bool ok = syncOnline(&timeSynced);
-    s_nextOnlineMs = millis() + (ok ? ONLINE_PERIOD_MS : ONLINE_RETRY_MS);
+    clockSample(0);
+    const uint32_t period =
+        isNight(s_clock, s_clockOk && (s_timeValid || timeSynced))
+            ? NIGHT_ONLINE_PERIOD_MS
+            : ONLINE_PERIOD_MS;
+    s_nextOnlineMs = millis() + (ok ? period : ONLINE_RETRY_MS);
     // A window that reached NTP but not Open-Meteo still fixed the clock.
     if (timeSynced) s_timeValid = true;
     forceRedraw();  // the face is stale after the attempt either way
@@ -648,6 +804,13 @@ void loop() {
 #ifdef WIFI_SSID
     if (holdsRadio(was) && !holdsRadio(s_screen)) radioDown();
 #endif
+
+    // The clock face rests cheap and the other three do not: the panel goes to
+    // LPM and the CPU to 80 MHz only where a frame a minute is the most that
+    // can happen. Done before the frame below, so the busy frame is already
+    // written at the rate the new screen will keep.
+    displayLowPower(s_screen == UI_SCREEN_CLOCK);
+    cpuForScreen(s_screen);
 
     if (s_screen != UI_SCREEN_CLOCK) {
       // Bringing the radio up takes seconds and the panel is frozen for every
@@ -704,45 +867,19 @@ void loop() {
     if (pcPoll()) forceRedraw();
   }
 
-  // The RTC sits on a 100 kHz bus and a read is about a millisecond. On the
-  // clock face that happens once per 50 ms pass and costs nothing, but the
-  // pager runs the loop at 5 ms so it can watch its socket, and reading the
-  // RTC every pass there would spend a fifth of the CPU re-fetching a value
-  // that only feeds an HH:MM. So off the clock face it is sampled on its own
-  // schedule, and in between the last reading stands.
-  static struct tm s_clock;
-  static bool s_clockRead = false;
-  static bool s_clockOk = false;
-  static uint32_t s_clockMs = 0;
-
-  const uint32_t clockPeriod = (s_screen == UI_SCREEN_CLOCK) ? 0 : 250;
-  if (!s_clockRead || (millis() - s_clockMs) >= clockPeriod) {
-    s_clockMs = millis();
-    s_clockRead = true;
-    if (rtcPresent()) {
-      // A false here means the RTC lost power while running; s_timeValid
-      // stays the authority on whether the *source* was ever trustworthy.
-      s_clockOk = rtcReadTime(&s_clock);
-    } else {
-      // No RTC on the bus — fall back to the ESP's own clock, which
-      // applyTime() keeps in step whenever a real source turns up.
-      const time_t t = time(nullptr);
-      localtime_r(&t, &s_clock);
-      s_clockOk = true;
-    }
-  }
-
+  // Sampled again, and captured, only here: three things above this line can
+  // block for seconds — the sync window, a headline fetch, opening a session —
+  // and a frame drawn from a reading taken before one of them would carry a
+  // minute that has since turned. The call is throttled, so on an ordinary
+  // pass this is the reading the top of the loop already took.
+  clockSample(s_screen == UI_SCREEN_CLOCK ? CLOCK_SAMPLE_MS : 250);
   const struct tm now = s_clock;
   const bool valid = s_clockOk && s_timeValid;
 
   // The panel holds its image on its own, so it is only rewritten when what it
-  // shows has actually changed: every second on the clock, but once a minute
-  // on a news screen, where the bar is the only thing that moves.
-  const bool changed = (s_screen == UI_SCREEN_CLOCK)
-                           ? (now.tm_sec != s_lastSecond)
-                           : (now.tm_min != s_lastMinute);
-  if (changed) {
-    s_lastSecond = now.tm_sec;
+  // shows has actually changed — which, on all four screens now, is once a
+  // minute. The clock face joined the other three when it gave up its seconds.
+  if (now.tm_min != s_lastMinute) {
     s_lastMinute = now.tm_min;
     s_ui.time = now;
     s_ui.timeValid = valid;
@@ -754,11 +891,47 @@ void loop() {
   // arrive together.
   if (chirp) audioNotify();
 
-  // The two session screens watch a socket rather than a clock, so they are
-  // polled fast; every other screen only ever changes once a second. The
-  // PC's answers are 72 bytes twice a second, which 10 ms keeps up with.
+  // The pace at the foot of the pass. The two session screens watch a socket
+  // rather than a clock, so they are polled fast and never sleep; the PC's
+  // answers are 72 bytes twice a second, which 10 ms keeps up with.
+  //
+  // The clock face is the opposite, and is where nearly all of the power goes:
+  // nothing on it changes until the minute does, so it sleeps to the boundary
+  // and wakes just past it with the new value already in the RTC. Three things
+  // keep it awake even there:
+  //
+  //   * a USB console, which light sleep disconnects. A board on a desk with
+  //     the monitor open stays exactly as responsive as it was, and a board on
+  //     the 18650 sleeps. Nothing to configure — this is the difference
+  //     between a host that has enumerated the port and a charger that has not.
+  //   * Wi-Fi up, which off the session screens only happens inside the sync
+  //     window, and that window blocks anyway.
+  //   * a clock that is not set, which has no minute boundary to aim at and
+  //     probably has somebody at the console about to give it one.
   uint32_t pace = 50;
   if (s_screen == UI_SCREEN_PAGER) pace = 5;
   if (s_screen == UI_SCREEN_PC) pace = 10;
-  delay(pace);
+
+  bool slept = false;
+  if (s_screen == UI_SCREEN_CLOCK && valid && !Serial
+#ifdef WIFI_SSID
+      && WiFi.status() != WL_CONNECTED
+#endif
+  ) {
+    // What is left of the minute, less the age of the reading that was worked
+    // out from, plus the overshoot that lands the wake after the turn.
+    const uint32_t age = millis() - s_clockMs;
+    int32_t sleepMs = (int32_t)((60 - now.tm_sec) * 1000) - (int32_t)age +
+                      (int32_t)WAKE_OVERSHOOT_MS;
+#ifdef WIFI_SSID
+    // Never sleep past a sync window that is already due.
+    const int32_t toOnline = (int32_t)(s_nextOnlineMs - millis());
+    if (toOnline > 0 && toOnline < sleepMs) sleepMs = toOnline;
+#endif
+    if (sleepMs >= (int32_t)SLEEP_FLOOR_MS) {
+      clockSleep((uint32_t)sleepMs);
+      slept = true;
+    }
+  }
+  if (!slept) delay(pace);
 }
