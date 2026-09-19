@@ -54,11 +54,44 @@ on this machine.
 
 ## Build & run
 
+Go 1.23 or newer, and nothing else: there are no non-stdlib dependencies,
+so `go build` downloads nothing and there is no `go.sum`.
+
 ```powershell
 cd rtss_api
 go build -o rtss_api.exe .
 .\rtss_api.exe -addr :8099 -gpu 0
 ```
+
+### Cross-compiling from macOS or Linux
+
+The server only *runs* on Windows, but it builds anywhere — Go's toolchain
+is a cross-compiler by default:
+
+```bash
+cd rtss_api
+GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o rtss_api.exe .
+```
+
+No Windows SDK, mingw or VM is needed. The Windows runtime ships as source
+inside the toolchain and is compiled for the target along with this code; a
+pure-Go binary links against no libc; and the Win32 entry points are bound by
+name at run time (`syscall.NewLazyDLL("kernel32.dll")` in
+`internal/winshm/winshm.go`), so `kernel32.dll` is only a string at build
+time. The one requirement is no cgo — `CGO_ENABLED` goes to 0 automatically
+when cross-compiling, and this package uses only `syscall` and `unsafe`.
+
+Every file here carries `//go:build windows`, so a plain `go build` on a
+non-Windows host reports `build constraints exclude all Go files` — that is
+the constraint doing its job, not a broken tree. Set `GOOS=windows`.
+
+For a binary that leaves your machine, keep both release flags above:
+`-trimpath` strips the build machine's absolute paths (otherwise
+`C:/Users/you/...` is readable with `strings`), and `-ldflags "-s -w"` drops
+the symbol table and DWARF, taking ~8.1 MB down to ~6.3 MB. Panic stack
+traces survive that — they come from `pclntab`, which the linker keeps; only
+delve-style debugging is lost. Inspect the result with `file rtss_api.exe`
+(expect `PE32+ executable (console) x86-64`) and `go version -m rtss_api.exe`.
 
 Flags:
 - `-addr` — HTTP listen address (default `:8099`)
