@@ -35,8 +35,9 @@
 
 #include "app.h"
 
-#if defined(WIFI_SSID) && defined(NEWS_API_KEY)
-#define NEWS_ENABLED 1
+// NEWS_ENABLED is decided in app.h, together with the other three modes: the
+// news mode has to be built in *and* the key has to be there.
+#ifdef NEWS_ENABLED
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -56,8 +57,10 @@ const char *newsStamp() { return s_stamp; }
 
 #ifndef NEWS_ENABLED
 
-// Without both the Wi-Fi credentials and the API key there is nothing to ask.
-// The screen says which one is missing rather than sitting empty.
+// The news mode switched off, or built without the Wi-Fi credentials and the
+// API key, so there is nothing to ask. A screen that is built but starved
+// says which value is missing rather than sitting empty; one whose mode is
+// off is not in the cycle at all.
 bool newsFetch() { return false; }
 
 #else

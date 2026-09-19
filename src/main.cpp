@@ -29,9 +29,16 @@
 // wear. The SHTC3 is still on the bus and still readable with "?" at the
 // console — it is simply not on the panel.
 //
-// KEY (GPIO18) steps through four screens — the clock, the world headlines,
-// the Telegram pager and the gaming PC's telemetry — and the clock comes back
-// on its own from the headlines after SCREEN_HOLD_MS.
+// KEY (GPIO18) steps through the screens — the clock, the world headlines, the
+// Telegram pager and the gaming PC's telemetry — and the clock comes back on
+// its own from the headlines after SCREEN_HOLD_MS.
+//
+// Which of the four are in a given build is [modes] in platformio.ini, one
+// switch each (see app.h). A mode that is off is not compiled in and is not in
+// the cycle: KEY never reaches it, nothing fetches for it, and the screens
+// that are left read as a cycle of their own — the board even comes up on
+// whichever one is first. With all four off the firmware still boots and the
+// panel says there is nothing switched on, which is the whole of it.
 //
 // The clock face is also the only screen that is built to be *cheap*, because
 // it is the one the thing spends its life on. It carries no seconds, so it is
@@ -88,7 +95,7 @@
 #include "driver/gpio.h"
 #include "esp_sleep.h"
 
-#ifdef WIFI_SSID
+#ifdef NET_ENABLED
 #include <WiFi.h>
 #include "esp_sntp.h"
 #endif
@@ -98,7 +105,7 @@
 // not have happened.
 static const uint32_t BATTERY_PERIOD_MS = 60000;
 
-#ifdef WIFI_SSID
+#ifdef NET_ENABLED
 static const uint32_t ONLINE_PERIOD_MS = 30UL * 60 * 1000;  // NTP + weather
 static const uint32_t ONLINE_RETRY_MS = 60UL * 1000;        // sooner after a failure
 static uint32_t s_nextOnlineMs = 0;
@@ -138,7 +145,7 @@ static const uint32_t SLEEP_FLOOR_MS = 250;
 static const uint32_t CPU_MHZ_IDLE = 80;
 static const uint32_t CPU_MHZ_BUSY = 240;
 
-#ifdef WIFI_SSID
+#ifdef NET_ENABLED
 // The hours the sync window opens half as often. Not a window that stops: the
 // RTC wants disciplining whether or not anybody is awake for it, and a clock
 // that drifts overnight is the one fault this thing cannot have. What is not
@@ -156,7 +163,10 @@ static bool s_timeValid = false;
 // Every screen ticks on the minute now: the clock face joined the other three
 // when it gave up its seconds, and nothing on any of them moves faster.
 static int s_lastMinute = -1;
-static UiScreen s_screen = UI_SCREEN_CLOCK;
+// The mode on the panel. Set in setup() from the cycle this build carries —
+// which starts at the clock where that mode is built and somewhere else where
+// it is not, and is empty when nothing at all is switched on.
+static UiScreen s_screen = UI_SCREEN_NONE;
 static uint32_t s_screenMs = 0;
 static uint32_t s_lastBatteryMs = 0;
 static char s_note[32] = "";
@@ -211,7 +221,7 @@ static bool applyTime(struct tm *t, const char *source) {
   return ok;
 }
 
-#ifdef WIFI_SSID
+#ifdef NET_ENABLED
 // The face is frozen for as long as an attempt lasts, so every window is kept
 // as short as the network allows: the NTP one has to cover a DNS lookup for the
 // pool plus the first poll, which is what the earlier 8 s was losing to.
@@ -273,6 +283,7 @@ static bool syncOnline(bool *timeSynced) {
     Serial.println("ntp: no answer");
   }
 
+#ifdef WEATHER_ENABLED
   // The forecast is fetched second: it is stamped with the local time, and by
   // now that is the time NTP just handed over rather than yesterday's drift.
   const bool weatherOk = weatherFetch();
@@ -280,6 +291,12 @@ static bool syncOnline(bool *timeSynced) {
   // not worth reopening the window every sixty seconds while it is down. The
   // next scheduled window simply asks again.
   airQualityFetch();
+#else
+  // No clock face in this build, so nothing on the panel would ever show a
+  // forecast: the window is NTP and nothing else, and the bars on the other
+  // screens get their HH:MM out of it all the same.
+  const bool weatherOk = true;
+#endif
 
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
@@ -287,11 +304,11 @@ static bool syncOnline(bool *timeSynced) {
   if (timeSynced != nullptr) *timeSynced = timeOk;
   return timeOk && weatherOk;
 }
-#endif  // WIFI_SSID
+#endif  // NET_ENABLED
 
 // --- the radio, and what it is brought up for -----------------------------
 
-#ifdef WIFI_SSID
+#ifdef NET_ENABLED
 // Brings Wi-Fi up and waits for it, or gives up after WIFI_TIMEOUT_MS.
 //
 // Deliberately not syncOnline(): that window belongs to the clock and the
@@ -336,7 +353,7 @@ __attribute__((unused)) static void withRadio(const char *what,
 }
 #endif
 
-#if defined(WIFI_SSID) && defined(NEWS_API_KEY)
+#ifdef NEWS_ENABLED
 static void refreshNews() { withRadio("news", newsFetch); }
 #else
 // Without both the credentials and the key there is nothing to ask, and no
@@ -405,7 +422,7 @@ static void pcStart() {}
 static void pcKeepRadio() {}
 #endif
 
-#ifdef WIFI_SSID
+#ifdef NET_ENABLED
 // The screens that keep Wi-Fi up for as long as they are showing: the two
 // sessions, where this build has them.
 static bool holdsRadio(UiScreen screen) {
@@ -458,7 +475,7 @@ static void clockSample(uint32_t period) {
   }
 }
 
-#ifdef WIFI_SSID
+#ifdef NET_ENABLED
 // A clock that was never set has no night: the hour in it is whatever the
 // RTC's registers happened to hold, and stretching the sync window on that
 // would hide the one thing that could still fix it.
@@ -469,11 +486,17 @@ static bool isNight(const struct tm &t, bool valid) {
 
 // --- how hard the SoC works -----------------------------------------------
 
-// The clock face is the screen this thing spends its life on, so it is the one
-// built to be cheap; the other three are what somebody is standing in front of.
+// The screens where nothing moves on its own: the clock face, which changes
+// once a minute and is what this thing spends its life on, and the empty
+// build's notice, which never changes at all. Both rest with the panel in its
+// low-power mode and the CPU at 80 MHz; the other three are what somebody is
+// standing in front of.
+static bool screenIsIdle(UiScreen screen) {
+  return screen == UI_SCREEN_CLOCK || screen == UI_SCREEN_NONE;
+}
+
 static void cpuForScreen(UiScreen screen) {
-  const uint32_t want =
-      (screen == UI_SCREEN_CLOCK) ? CPU_MHZ_IDLE : CPU_MHZ_BUSY;
+  const uint32_t want = screenIsIdle(screen) ? CPU_MHZ_IDLE : CPU_MHZ_BUSY;
   if ((uint32_t)getCpuFrequencyMhz() != want) setCpuFrequencyMhz(want);
 }
 
@@ -513,6 +536,80 @@ static void clockSleep(uint32_t ms) {
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
 }
 
+// --- changing screens -----------------------------------------------------
+
+// Everything that has to happen when the panel moves to s_screen: the session
+// the old screen held is closed, the radio goes down unless the new one wants
+// it too, the panel and the CPU are set to the rate the new screen keeps, and
+// a screen that has to fetch gets a frame of its own before the wait.
+//
+// Three callers: KEY, the news screen folding back, and the end of setup() —
+// the board comes up on the first mode in the cycle, which is the clock only
+// where that mode is built. Pass UI_SCREEN_NONE as `was` there: nothing is
+// open yet.
+static void enterScreen(UiScreen was) {
+  // Leaving a session screen always ends its session. The radio goes down
+  // with it unless the next screen is a session too and would only have to
+  // bring it straight back up — which is how the pager hands it to the PC
+  // screen without a second wait for Wi-Fi.
+  if (was == UI_SCREEN_PAGER) pagerClose();
+  if (was == UI_SCREEN_PC) pcClose();
+#ifdef NET_ENABLED
+  if (holdsRadio(was) && !holdsRadio(s_screen)) radioDown();
+#endif
+
+  // The idle screens rest cheap and the others do not: the panel goes to LPM
+  // and the CPU to 80 MHz only where nothing can change faster than a minute.
+  // Done before the frame below, so the busy frame is already written at the
+  // rate the new screen will keep.
+  displayLowPower(screenIsIdle(s_screen));
+  cpuForScreen(s_screen);
+
+  if (!screenIsIdle(s_screen)) {
+    // Bringing the radio up takes seconds and the panel is frozen for every
+    // one of them, so the press gets a frame of its own before the wait
+    // rather than after it. s_ui still carries the time from the last draw,
+    // which is a second old at worst and only feeds the HH:MM in the bar.
+    s_ui.screen = s_screen;
+    s_ui.busy = true;
+    uiDraw(s_ui);
+    s_ui.busy = false;
+    if (s_screen == UI_SCREEN_NEWS) {
+      refreshNews();
+    } else if (s_screen == UI_SCREEN_PAGER) {
+      pagerStart();
+    } else if (s_screen == UI_SCREEN_PC) {
+      pcStart();
+    }
+  }
+
+  // Started after the radio came up, not before it: the hold is time to read
+  // what came back, and the seconds the radio took are not that.
+  s_screenMs = millis();
+}
+
+// What this build carries, named the way [modes] in platformio.ini names it:
+// four switches, and the cycle KEY actually walks. Printed at boot and by
+// "?", because a screen that is missing and a screen that is broken look the
+// same from the desk.
+static void printModes() {
+  Serial.printf("modes: clock=%d news=%d pager=%d pc=%d", MODE_CLOCK,
+                MODE_NEWS, MODE_PAGER, MODE_PC);
+  const int n = uiScreenCount();
+  if (n == 0) {
+    Serial.println(", nothing switched on - set them in platformio.ini");
+    return;
+  }
+  Serial.print(", KEY: ");
+  UiScreen at = uiScreenHome();
+  for (int i = 0; i < n; i++) {
+    if (i > 0) Serial.print(" -> ");
+    Serial.print(uiScreenName(at));
+    at = uiScreenNext(at);
+  }
+  Serial.println(n > 1 ? " -> ..." : " (the only mode)");
+}
+
 // "T2026-09-09 21:30:00" (the space may also be a 'T'), typed at the console.
 static void handleConsole() {
   static char line[64];
@@ -545,7 +642,7 @@ static void handleConsole() {
       } else {
         Serial.println("usage: T2026-09-09 21:30:00");
       }
-#ifdef WIFI_SSID
+#ifdef NET_ENABLED
     } else if (line[0] == 'N' || line[0] == 'n') {
       // Forces the scheduled window to open on the next pass through loop().
       // Time and weather only: the headlines are KEY's business and nothing
@@ -631,23 +728,25 @@ static void handleConsole() {
       if (pcError() != nullptr) Serial.printf(" [%s]", pcError());
 #endif
       Serial.printf(", speaker %s", audioPresent() ? "ready" : "MISSING");
-#ifdef WIFI_SSID
+#ifdef NET_ENABLED
       Serial.printf(", next sync in %ld s",
                     (long)((int32_t)(s_nextOnlineMs - millis()) / 1000));
 #endif
       Serial.println();
+      printModes();
     } else if (line[0] != '\0') {
       Serial.println("commands: T<YYYY-MM-DD HH:MM:SS> to set the clock,"
-#ifdef WIFI_SSID
+#ifdef NET_ENABLED
                      " N to sync time and weather now,"
 #endif
 #ifdef PAGER_ENABLED
                      " P to read telegram now,"
 #endif
                      " B to test the speaker,"
-                     " ? for status; KEY steps clock -> news -> pager -> pc,"
-                     " and the pager and pc screens stay up until KEY says"
+                     " ? for status; KEY steps through the modes below, and"
+                     " the pager and pc screens stay up until KEY says"
                      " otherwise");
+      printModes();
     }
   }
 }
@@ -662,6 +761,7 @@ void setup() {
   while (!Serial && millis() - t0 < 2000) delay(10);
 
   Serial.println("\nESP32-S3-RLCD-4.2 clock + weather, " TZ_LABEL);
+  printModes();
 
   memset(&s_ui, 0, sizeof(s_ui));
   s_ui.note = s_note;
@@ -689,7 +789,7 @@ void setup() {
     Serial.println("rtc: oscillator-stop flag set, the calendar is not trustworthy");
   }
 
-#ifdef WIFI_SSID
+#ifdef NET_ENABLED
   // One window at boot either way. Even a clock that survived needs it: the
   // forecast lives in RAM and does not survive anything.
   //
@@ -715,7 +815,7 @@ void setup() {
     Serial.println("set the clock with: T2026-09-09 21:30:00");
   }
 
-#ifdef WIFI_SSID
+#ifdef NET_ENABLED
   const uint32_t firstGap = allOk ? ONLINE_PERIOD_MS : ONLINE_RETRY_MS;
   s_nextOnlineMs = millis() + firstGap;
   Serial.printf("online: next sync in %lu min\n",
@@ -728,18 +828,21 @@ void setup() {
   s_lastBatteryMs = millis();
   Serial.printf("battery: %.2f V (%d%%)\n", s_ui.volts, s_ui.percent);
 
+  // The board comes up on the first mode in the cycle: the clock where that
+  // mode is built, the next one along where it is not, and the empty build's
+  // notice where nothing at all is switched on.
+  s_screen = uiScreenHome();
   s_ui.timeValid = s_timeValid;
   s_ui.screen = s_screen;
   uiDraw(s_ui);
   s_lastMinute = s_ui.time.tm_min;
-  s_screenMs = millis();
 
-  // The board comes up on the clock face, so it comes up in that face's two
-  // cheap states. Both were left alone until here on purpose: the boot sync
-  // window above wanted the radio, and the first frame wanted the panel at
-  // full rate.
-  displayLowPower(true);
-  cpuForScreen(s_screen);
+  // Through the same door as a press of KEY, so a board whose first mode is a
+  // session opens that session at boot the way KEY would. Nothing is open
+  // yet, hence UI_SCREEN_NONE. It also settles the panel's mode and the CPU,
+  // both left alone until here on purpose: the boot sync window above wanted
+  // the radio, and the first frame wanted the panel at full rate.
+  enterScreen(UI_SCREEN_NONE);
 }
 
 void loop() {
@@ -749,9 +852,9 @@ void loop() {
 
   // Sampled before anything else needs it: the window below asks what hour it
   // is, and the sleep at the foot asks how much of the minute is left.
-  clockSample(s_screen == UI_SCREEN_CLOCK ? CLOCK_SAMPLE_MS : 250);
+  clockSample(screenIsIdle(s_screen) ? CLOCK_SAMPLE_MS : 250);
 
-#ifdef WIFI_SSID
+#ifdef NET_ENABLED
   // Signed difference, so the schedule survives the millis() rollover. Held
   // off while a session screen is up: that screen owns the radio and a sync
   // window would tear its connection down under it, for a clock nobody is
@@ -792,47 +895,16 @@ void loop() {
   if (keyDown && !keyWasDown && (nowMs - keyLastMs) >= KEY_DEBOUNCE_MS) {
     keyLastMs = nowMs;
     const UiScreen was = s_screen;
-    s_screen = (UiScreen)((s_screen + 1) % UI_SCREEN_COUNT);
-    readBattery();
-
-    // Leaving a session screen always ends its session. The radio goes down
-    // with it unless the next screen is a session too and would only have to
-    // bring it straight back up — which is how the pager hands it to the PC
-    // screen without a second wait for Wi-Fi.
-    if (was == UI_SCREEN_PAGER) pagerClose();
-    if (was == UI_SCREEN_PC) pcClose();
-#ifdef WIFI_SSID
-    if (holdsRadio(was) && !holdsRadio(s_screen)) radioDown();
-#endif
-
-    // The clock face rests cheap and the other three do not: the panel goes to
-    // LPM and the CPU to 80 MHz only where a frame a minute is the most that
-    // can happen. Done before the frame below, so the busy frame is already
-    // written at the rate the new screen will keep.
-    displayLowPower(s_screen == UI_SCREEN_CLOCK);
-    cpuForScreen(s_screen);
-
-    if (s_screen != UI_SCREEN_CLOCK) {
-      // Bringing the radio up takes seconds and the panel is frozen for every
-      // one of them, so the press gets a frame of its own before the wait
-      // rather than after it. s_ui still carries the time from the last draw,
-      // which is a second old at worst and only feeds the HH:MM in the bar.
-      s_ui.screen = s_screen;
-      s_ui.busy = true;
-      uiDraw(s_ui);
-      s_ui.busy = false;
-      if (s_screen == UI_SCREEN_NEWS) {
-        refreshNews();
-      } else if (s_screen == UI_SCREEN_PAGER) {
-        pagerStart();
-      } else {
-        pcStart();
-      }
+    // The cycle is whatever modes this build carries, so a screen that is
+    // switched off is not stepped past — it is not there. With one mode built
+    // in the next screen is this one and the press does nothing, which is the
+    // truth about a button with nowhere to go.
+    s_screen = uiScreenNext(was);
+    if (s_screen != was) {
+      readBattery();
+      enterScreen(was);
+      forceRedraw();
     }
-    // Started after the radio came up, not before it: the hold is time to
-    // read what came back, and the seconds the radio took are not that.
-    s_screenMs = millis();
-    forceRedraw();
   }
   keyWasDown = keyDown;
 
@@ -843,8 +915,14 @@ void loop() {
   // otherwise. millis() rather than nowMs, which a fetch just above may have
   // left seconds behind: stale, it would read as a huge elapsed time and
   // bounce straight back to the clock.
-  if (s_screen == UI_SCREEN_NEWS && millis() - s_screenMs >= SCREEN_HOLD_MS) {
-    s_screen = UI_SCREEN_CLOCK;
+  if (s_screen == UI_SCREEN_NEWS && millis() - s_screenMs >= SCREEN_HOLD_MS &&
+      uiScreenHome() != UI_SCREEN_NEWS) {
+    // Home is the first mode in the cycle — the clock where that mode is
+    // built, and where it is not, whatever comes first. A build whose first
+    // mode *is* the news has nowhere to fold back to, so it stays.
+    const UiScreen was = s_screen;
+    s_screen = uiScreenHome();
+    enterScreen(was);
     forceRedraw();
   }
 
@@ -872,7 +950,7 @@ void loop() {
   // and a frame drawn from a reading taken before one of them would carry a
   // minute that has since turned. The call is throttled, so on an ordinary
   // pass this is the reading the top of the loop already took.
-  clockSample(s_screen == UI_SCREEN_CLOCK ? CLOCK_SAMPLE_MS : 250);
+  clockSample(screenIsIdle(s_screen) ? CLOCK_SAMPLE_MS : 250);
   const struct tm now = s_clock;
   const bool valid = s_clockOk && s_timeValid;
 
@@ -913,8 +991,14 @@ void loop() {
   if (s_screen == UI_SCREEN_PC) pace = 10;
 
   bool slept = false;
-  if (s_screen == UI_SCREEN_CLOCK && valid && !Serial
-#ifdef WIFI_SSID
+  if (s_screen == UI_SCREEN_NONE && !Serial) {
+    // An empty build: nothing on the panel will ever change, so there is no
+    // boundary to aim at and the wake is a formality. KEY still wakes it,
+    // and still has nowhere to go.
+    clockSleep(60000);
+    slept = true;
+  } else if (s_screen == UI_SCREEN_CLOCK && valid && !Serial
+#ifdef NET_ENABLED
       && WiFi.status() != WL_CONNECTED
 #endif
   ) {
@@ -923,7 +1007,7 @@ void loop() {
     const uint32_t age = millis() - s_clockMs;
     int32_t sleepMs = (int32_t)((60 - now.tm_sec) * 1000) - (int32_t)age +
                       (int32_t)WAKE_OVERSHOOT_MS;
-#ifdef WIFI_SSID
+#ifdef NET_ENABLED
     // Never sleep past a sync window that is already due.
     const int32_t toOnline = (int32_t)(s_nextOnlineMs - millis());
     if (toOnline > 0 && toOnline < sleepMs) sleepMs = toOnline;

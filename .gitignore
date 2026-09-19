@@ -10,3 +10,6 @@
 *.pdf
 
 .DS_Store
+
+# Собранный сервер rtss_api — раздаётся ассетом релиза, а не через историю git
+rtss_api/rtss_api.exe

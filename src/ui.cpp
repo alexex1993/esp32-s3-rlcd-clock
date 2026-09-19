@@ -197,7 +197,12 @@ static void drawBatteryIcon(int x, int y, int percent) {
   if (fill > 0) lcd.drawBox(x + 2, y + 2, fill, h - 4);
 }
 
-// --- weather glyphs -------------------------------------------------------
+// --- the clock face -------------------------------------------------------
+// Everything from here to the list screens is the clock mode and nothing
+// else: the glyphs, the status bar, HH:MM, the outdoor row, the forecast
+// strip and the sunset footer. With MODE_CLOCK at 0 none of it is built, and
+// weather.cpp is a stub for the same reason — no screen asks it anything.
+#if MODE_CLOCK
 
 enum IconKind {
   ICON_SUN,
@@ -593,13 +598,73 @@ static void drawForecast(const UiState &s) {
   }
 }
 
+#endif  // MODE_CLOCK
+
 // --- the list screens -----------------------------------------------------
 
-// The two headings. Every other Russian label on the panel lives in this
-// file, so these do too.
+// The four headings, which double as the names KEY's footer calls the screens
+// by. Every other Russian label on the panel lives in this file, so these do
+// too.
+static const char kClockHeading[] = "ЧАСЫ";
 static const char kNewsHeading[] = "В МИРЕ";
 static const char kPagerHeading[] = "ПЕЙДЖЕР";
 static const char kPcHeading[] = "КОМПЬЮТЕР";
+
+// --- the cycle KEY steps through ------------------------------------------
+// Built from the MODE_ switches in app.h, which come from [modes] in
+// platformio.ini. This table is the only thing that decides what a press of
+// KEY does, so a mode that is switched off is simply not in it — there is no
+// screen to reach and nothing anywhere that says there might have been.
+
+#if MODE_COUNT > 0
+
+static const UiScreen kCycle[] = {
+#if MODE_CLOCK
+    UI_SCREEN_CLOCK,
+#endif
+#if MODE_NEWS
+    UI_SCREEN_NEWS,
+#endif
+#if MODE_PAGER
+    UI_SCREEN_PAGER,
+#endif
+#if MODE_PC
+    UI_SCREEN_PC,
+#endif
+};
+static const int kCycleLen = (int)(sizeof(kCycle) / sizeof(kCycle[0]));
+
+int uiScreenCount() { return kCycleLen; }
+UiScreen uiScreenHome() { return kCycle[0]; }
+
+UiScreen uiScreenNext(UiScreen cur) {
+  for (int i = 0; i < kCycleLen; i++) {
+    // The wrap is what makes one mode a special case on its own: the next
+    // screen is this one, and the caller reads that as "KEY has nowhere to
+    // go" rather than drawing a footer pointing at the screen it is on.
+    if (kCycle[i] == cur) return kCycle[(i + 1) % kCycleLen];
+  }
+  // A screen this build does not carry — nothing reaches here in practice.
+  return kCycle[0];
+}
+
+#else  // an empty build: no modes, so no cycle and nowhere to step
+
+int uiScreenCount() { return 0; }
+UiScreen uiScreenHome() { return UI_SCREEN_NONE; }
+UiScreen uiScreenNext(UiScreen) { return UI_SCREEN_NONE; }
+
+#endif
+
+const char *uiScreenName(UiScreen screen) {
+  switch (screen) {
+    case UI_SCREEN_CLOCK: return kClockHeading;
+    case UI_SCREEN_NEWS:  return kNewsHeading;
+    case UI_SCREEN_PAGER: return kPagerHeading;
+    case UI_SCREEN_PC:    return kPcHeading;
+    default:              return "";
+  }
+}
 
 // Splits `s` into at most maxLines lines no wider than maxW pixels, breaking
 // on spaces; the caller has already selected the font. Returns the line count.
@@ -610,6 +675,8 @@ static const char kPcHeading[] = "КОМПЬЮТЕР";
 // own, so the line is trimmed a character at a time until the marker fits too
 // rather than divided out arithmetically — these faces are variable-width for
 // the ASCII half of a mixed headline.
+#if MODE_NEWS || MODE_PAGER
+
 static int wrapText(const char *s, int maxW, int maxLines,
                     char out[][FEED_LINE_CAP]) {
   int lines = 0;
@@ -683,6 +750,12 @@ static int wrapText(const char *s, int maxW, int maxLines,
   return lines;
 }
 
+#endif  // MODE_NEWS || MODE_PAGER
+
+// The bar and the footer are shared with the PC screen as well, so they are
+// built for any of the three.
+#if MODE_NEWS || MODE_PAGER || MODE_PC
+
 // The section name on the left, and the clock on the right — the clock is what
 // you gave up to look at this screen, so it does not disappear entirely.
 static void drawFeedBar(const UiState &s, const char *heading) {
@@ -714,19 +787,29 @@ static void drawFeedBar(const UiState &s, const char *heading) {
   lcd.setDrawColor(1);
 }
 
-// Where the list stands on the left, and what KEY does next on the right.
-// `next` names the screen the button goes to from here, so the three of them
-// read as a cycle rather than as a pair of dead ends.
-static void drawFeedFooter(const char *left, const char *next) {
+// Where the list stands on the left, and what KEY does next on the right —
+// the screen the button actually goes to from here, taken from the cycle this
+// build carries rather than named at the call site, so the screens read as a
+// cycle however many of the four are switched on. With only one mode built in
+// the right-hand half is left off: KEY has nowhere to go, and a footer
+// pointing at the screen you are already on would be a lie.
+static void drawFeedFooter(const UiState &s, const char *left) {
   char buf[48];
 
   lcd.drawHLine(0, FEED_BOTTOM + 6, W);
   lcd.setFont(u8g2_font_6x12_t_cyrillic);
   lcd.drawUTF8(FEED_PAD, SUNSET_BASE, left);
 
-  snprintf(buf, sizeof(buf), "KEY: %s", next);
+  const UiScreen next = uiScreenNext(s.screen);
+  if (next == s.screen || next == UI_SCREEN_NONE) return;
+
+  snprintf(buf, sizeof(buf), "KEY: %s", uiScreenName(next));
   drawRight(buf, W - FEED_PAD, SUNSET_BASE);
 }
+
+#endif  // MODE_NEWS || MODE_PAGER || MODE_PC
+
+#if MODE_NEWS || MODE_PAGER
 
 // The screen both lists share. `why` is what to say when there is nothing to
 // list — which reason it is decides what the user has to go and fix, so the
@@ -743,14 +826,14 @@ static void drawFeedFooter(const char *left, const char *next) {
 // fills its last line; without it they are simply left off such an item.
 static void drawFeedScreen(const UiState &s, const char *heading,
                            const FeedItem *items, int n, int maxLines,
-                           bool metaLine, const char *footer, const char *why,
-                           const char *next) {
+                           bool metaLine, const char *footer,
+                           const char *why) {
   drawFeedBar(s, heading);
 
   if (n <= 0) {
     lcd.setFont(u8g2_font_9x15_t_cyrillic);
     drawCentered(why, W / 2, 150);
-    drawFeedFooter(footer, next);
+    drawFeedFooter(s, footer);
     return;
   }
 
@@ -824,8 +907,12 @@ static void drawFeedScreen(const UiState &s, const char *heading,
     y += h + FEED_ITEM_GAP;
   }
 
-  drawFeedFooter(footer, next);
+  drawFeedFooter(s, footer);
 }
+
+#endif  // MODE_NEWS || MODE_PAGER
+
+#if MODE_NEWS
 
 static void drawNewsScreen(const UiState &s) {
   char footer[48];
@@ -851,8 +938,12 @@ static void drawNewsScreen(const UiState &s) {
   why = "нет ключа NEWS_API в .env";
 #endif
   drawFeedScreen(s, kNewsHeading, newsItems(), newsCount(), NEWS_MAX_LINES,
-                 NEWS_META_LINE, footer, why, "ПЕЙДЖЕР");
+                 NEWS_META_LINE, footer, why);
 }
+
+#endif  // MODE_NEWS
+
+#if MODE_PAGER
 
 static void drawPagerScreen(const UiState &s) {
   char footer[48];
@@ -895,8 +986,10 @@ static void drawPagerScreen(const UiState &s) {
   why = "нет SOCKS5_HOST в .env";
 #endif
   drawFeedScreen(s, kPagerHeading, pagerItems(), pagerCount(), PAGER_MAX_LINES,
-                 PAGER_META_LINE, footer, why, kPcHeading);
+                 PAGER_META_LINE, footer, why);
 }
+
+#endif  // MODE_PAGER
 
 // --- the PC screen --------------------------------------------------------
 // The gaming PC's telemetry, from rtss_api (see rtss.cpp). The same bar and
@@ -917,6 +1010,8 @@ static void drawPagerScreen(const UiState &s) {
 // Each column's numbers are right-aligned to the widest value it normally
 // shows, so the digits line up down the table and nothing shifts sideways when
 // a reading comes or goes.
+
+#if MODE_PC
 
 static const int PC_FPS_BASE = 108;
 static const int PC_GRAPH_TOP = 118;
@@ -1140,7 +1235,7 @@ static void drawPcScreen(const UiState &s) {
 #endif
     lcd.setFont(u8g2_font_9x15_t_cyrillic);
     drawCentered(why, W / 2, 150);
-    drawFeedFooter(footer, "ЧАСЫ");
+    drawFeedFooter(s, footer);
     return;
   }
 
@@ -1148,7 +1243,28 @@ static void drawPcScreen(const UiState &s) {
   drawPcGraph();
   drawPcTable(m);
 
-  drawFeedFooter(footer, "ЧАСЫ");
+  drawFeedFooter(s, footer);
+}
+
+#endif  // MODE_PC
+
+// --- nothing switched on --------------------------------------------------
+// Every mode at 0 in platformio.ini. The panel says so rather than staying
+// blank: this is a reflective screen with no backlight, so a blank one and a
+// board that never came up are the same picture. Named in the same place the
+// switches are, so whoever flashed it knows where to go.
+static void drawEmptyScreen() {
+  static const char kTitle[] = "ПУСТАЯ ПРОШИВКА";
+  lcd.setFont(u8g2_font_10x20_t_cyrillic);
+  drawBoldUTF8(W / 2 - lcd.getUTF8Width(kTitle) / 2, 120, kTitle);
+
+  lcd.setFont(u8g2_font_9x15_t_cyrillic);
+  drawCentered("ни один режим не включён", W / 2, 158);
+  drawCentered("включите их в platformio.ini:", W / 2, 196);
+  drawCentered("[modes] clock / news / pager / pc", W / 2, 218);
+
+  lcd.setFont(u8g2_font_6x12_t_cyrillic);
+  drawCentered("1 - режим в прошивке, 0 - нет", W / 2, SUNSET_BASE);
 }
 
 void uiDraw(const UiState &s) {
@@ -1161,22 +1277,36 @@ void uiDraw(const UiState &s) {
 
   lcd.clearBuffer();
 
+  // Only the modes this build carries are in here, and main.cpp only ever
+  // asks for one of those; the default is the empty build's notice, which is
+  // also what a screen belonging to a mode that is switched off would fall to.
   switch (s.screen) {
-    case UI_SCREEN_NEWS:
-      drawNewsScreen(s);
-      break;
-    case UI_SCREEN_PAGER:
-      drawPagerScreen(s);
-      break;
-    case UI_SCREEN_PC:
-      drawPcScreen(s);
-      break;
-    default:
+#if MODE_CLOCK
+    case UI_SCREEN_CLOCK:
       drawStatusBar(s);
       drawClock(s);
       drawOutdoorRow();
       drawForecast(s);
       drawFooter(s);
+      break;
+#endif
+#if MODE_NEWS
+    case UI_SCREEN_NEWS:
+      drawNewsScreen(s);
+      break;
+#endif
+#if MODE_PAGER
+    case UI_SCREEN_PAGER:
+      drawPagerScreen(s);
+      break;
+#endif
+#if MODE_PC
+    case UI_SCREEN_PC:
+      drawPcScreen(s);
+      break;
+#endif
+    default:
+      drawEmptyScreen();
       break;
   }
 

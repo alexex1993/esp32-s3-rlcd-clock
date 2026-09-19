@@ -50,7 +50,9 @@
 
 #include "app.h"
 
-#ifdef WIFI_SSID
+// WEATHER_ENABLED, from app.h: the credentials, and the clock mode, which is
+// the only screen a forecast is ever drawn on.
+#ifdef WEATHER_ENABLED
 #include <HTTPClient.h>
 #include <WiFi.h>
 #endif
@@ -74,10 +76,10 @@ bool weatherNow(WeatherNow *out) {
   return true;
 }
 
-#ifndef WIFI_SSID
+#ifndef WEATHER_ENABLED
 
-// No credentials compiled in, so there is no network to ask. The panel simply
-// leaves the forecast strip empty and says so.
+// No credentials compiled in, or no clock face to draw a forecast on, so
+// there is nothing to ask for. The panel leaves the strip empty and says so.
 bool weatherFetch() { return false; }
 bool airQualityFetch() { return false; }
 
@@ -313,4 +315,4 @@ bool airQualityFetch() {
   return true;
 }
 
-#endif  // WIFI_SSID
+#endif  // WEATHER_ENABLED

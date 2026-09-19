@@ -8,6 +8,33 @@
 #define TZ_OFFSET_SECONDS (3 * 3600)  // UTC+3, no daylight saving
 #define TZ_LABEL "UTC+3"
 
+// --- which modes this build carries ---------------------------------------
+// The firmware is four screens and the [modes] section of platformio.ini says
+// which of them to build. 1 builds a mode in, 0 leaves it out completely: no
+// code, no fetch, no session, and no place in the cycle KEY steps through.
+// This is what one board is for and another is not — somebody wants only the
+// PC monitor, somebody else the clock and the pager.
+//
+// Defaulted here rather than required, so sources built without the ini —
+// another project, a bare compiler check — are the full firmware.
+#ifndef MODE_CLOCK
+#define MODE_CLOCK 1  // time, outdoors, the 12-hour forecast, sunset, battery
+#endif
+#ifndef MODE_NEWS
+#define MODE_NEWS 1  // world headlines, fetched on the way into the screen
+#endif
+#ifndef MODE_PAGER
+#define MODE_PAGER 1  // the live Telegram pager, through the SOCKS5 tunnel
+#endif
+#ifndef MODE_PC
+#define MODE_PC 1  // the gaming PC's GPU/CPU/VRAM/FPS, off rtss_api
+#endif
+
+// How many of them are on. Zero is a legal build: it still boots, and the
+// panel says there is nothing switched on rather than sitting blank — a blank
+// reflective panel and a board that never started look identical.
+#define MODE_COUNT (MODE_CLOCK + MODE_NEWS + MODE_PAGER + MODE_PC)
+
 // --- what this build can reach --------------------------------------------
 // scripts/env_flags.py turns .env into these; each one gates a different
 // amount of the firmware, and every branch must still build.
@@ -17,7 +44,31 @@
 //   TELEGRAM_BOT_TOKEN  }  the pager screen, which is proxy-only on purpose:
 //   SOCKS5_HOST         }  api.telegram.org is not reachable directly here.
 //   RTSS_HOST           the PC screen: rtss_api on the gaming PC, on the LAN
-#if defined(WIFI_SSID) && defined(TELEGRAM_BOT_TOKEN) && defined(SOCKS5_HOST)
+//
+// A mode and its credentials are two different questions, and the four
+// switches below are where they meet: the mode says whether the screen is in
+// this firmware at all, the .env macros say whether it has anything to talk
+// to. A screen that is built but starved says on the panel which value is
+// missing; a mode that is off says nothing, because it is not there.
+
+// The radio itself. Nothing brings Wi-Fi up for a mode that is switched off,
+// so a build with no modes at all never opens a sync window either.
+#if defined(WIFI_SSID) && MODE_COUNT > 0
+#define NET_ENABLED 1
+#endif
+
+// Open-Meteo is fetched for the clock face and nowhere else: it is the only
+// screen that shows a forecast.
+#if MODE_CLOCK && defined(NET_ENABLED)
+#define WEATHER_ENABLED 1
+#endif
+
+#if MODE_NEWS && defined(NET_ENABLED) && defined(NEWS_API_KEY)
+#define NEWS_ENABLED 1
+#endif
+
+#if MODE_PAGER && defined(NET_ENABLED) && defined(TELEGRAM_BOT_TOKEN) && \
+    defined(SOCKS5_HOST)
 #define PAGER_ENABLED 1
 // The ports are the only .env values that arrive as numbers rather than
 // string literals, and each falls back on its protocol's default.
@@ -26,7 +77,7 @@
 #endif
 #endif
 
-#if defined(WIFI_SSID) && defined(RTSS_HOST)
+#if MODE_PC && defined(NET_ENABLED) && defined(RTSS_HOST)
 #define PC_ENABLED 1
 #ifndef RTSS_PORT
 #define RTSS_PORT 8099  // rtss_api's own default, its -addr flag
@@ -374,15 +425,38 @@ uint16_t pcPort();
 
 // --- ui.cpp ---------------------------------------------------------------
 
-// What the panel is currently showing. KEY steps through these in order and
-// wraps back to the clock.
+// What the panel is currently showing. KEY steps through the modes this build
+// carries, in this order, and wraps round to the first of them — which is not
+// always the clock, since the clock is a mode like the other three.
 enum UiScreen {
   UI_SCREEN_CLOCK = 0,
   UI_SCREEN_NEWS,
   UI_SCREEN_PAGER,
   UI_SCREEN_PC,
+  // No mode is switched on. Not a screen anybody steps to: it is the whole
+  // of an empty build, and it says so on the panel.
+  UI_SCREEN_NONE,
   UI_SCREEN_COUNT,
 };
+
+// The cycle KEY walks, built in ui.cpp from the MODE_ switches above. Nothing
+// else decides what a press does, so a mode that is off is simply not there.
+
+// How many modes this build carries, 0..4.
+int uiScreenCount();
+
+// The screen the board comes up on and the news screen folds back to: the
+// first mode in the cycle, which is the clock where that mode is built and
+// whatever comes first where it is not. UI_SCREEN_NONE in an empty build.
+UiScreen uiScreenHome();
+
+// The screen after `cur`, wrapping. Returns `cur` itself when this build has
+// only one mode — there is nowhere for KEY to go, and the footer says nothing
+// about it rather than pointing at the screen you are already on.
+UiScreen uiScreenNext(UiScreen cur);
+
+// A screen's short Russian name, as the "KEY: ..." footer says it.
+const char *uiScreenName(UiScreen screen);
 
 struct UiState {
   struct tm time;
